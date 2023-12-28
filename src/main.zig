@@ -36,6 +36,11 @@ const EditorKey = enum(u32) {
     ARROW_RIGHT,
     ARROW_UP,
     ARROW_DOWN,
+    HOME_KEY,
+    END_KEY,
+    DEL_KEY,
+    PAGE_UP,
+    PAGE_DOWN,
 };
 
 // Globals
@@ -91,15 +96,38 @@ fn editorReadKey() !u32 {
     var buf: [1]u8 = undefined;
     while (try std.io.getStdIn().read(buf[0..]) != 1) {}
     if (buf[0] == escape.esc[0]) {
-        var seq: [2]u8 = undefined;
-        if (try std.io.getStdIn().read(seq[0..]) != 2) return buf[0];
+        var seq: [3]u8 = undefined;
+        if (try std.io.getStdIn().read(seq[0..2]) != 2) return buf[0];
 
         if (seq[0] == '[') {
+            if (seq[1] >= '0' and seq[1] <= '9') {
+                if (try std.io.getStdIn().read(seq[2..3]) != 1) return buf[0];
+                if (seq[2] == '~') {
+                    switch (seq[1]) {
+                        '1' => return @intFromEnum(EditorKey.HOME_KEY),
+                        '3' => return @intFromEnum(EditorKey.DEL_KEY),
+                        '4' => return @intFromEnum(EditorKey.END_KEY),
+                        '5' => return @intFromEnum(EditorKey.PAGE_UP),
+                        '6' => return @intFromEnum(EditorKey.PAGE_DOWN),
+                        '7' => return @intFromEnum(EditorKey.HOME_KEY),
+                        '8' => return @intFromEnum(EditorKey.END_KEY),
+                        else => {},
+                    }
+                }
+            }
             switch (seq[1]) {
                 'A' => return @intFromEnum(EditorKey.ARROW_UP),
                 'B' => return @intFromEnum(EditorKey.ARROW_DOWN),
                 'C' => return @intFromEnum(EditorKey.ARROW_RIGHT),
                 'D' => return @intFromEnum(EditorKey.ARROW_LEFT),
+                'H' => return @intFromEnum(EditorKey.HOME_KEY),
+                'F' => return @intFromEnum(EditorKey.END_KEY),
+                else => {},
+            }
+        } else if (seq[0] == 'O') {
+            switch (seq[1]) {
+                'H' => return @intFromEnum(EditorKey.HOME_KEY),
+                'F' => return @intFromEnum(EditorKey.END_KEY),
                 else => {},
             }
         }
@@ -112,7 +140,6 @@ fn getWindowSize() !WindowSize {
     if (std.os.linux.ioctl(STDOUT.handle, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws)) != 0 or ws.ws_col == 0) {
         if (try STDOUT.write(escape.cursor_to_bot ++ escape.cursor_to_right) != 12) return TermError.get_win_size_failed;
         return getCursorPosition();
-        // return TermError.get_win_size_failed;
     }
     return WindowSize{ .rows = ws.ws_row, .cols = ws.ws_col };
 }
@@ -178,20 +205,34 @@ fn editorProcessKeyPress() !bool {
 
     switch (c) {
         ctrlKey('q') => return false,
-        @intFromEnum(EditorKey.ARROW_UP), @intFromEnum(EditorKey.ARROW_LEFT), @intFromEnum(EditorKey.ARROW_DOWN), @intFromEnum(EditorKey.ARROW_RIGHT) => editorMoveCursor(c),
+        1000...1000 + std.enums.values(EditorKey).len => {
+            const k: EditorKey = @enumFromInt(c);
+            switch (k) {
+                .ARROW_UP, .ARROW_LEFT, .ARROW_DOWN, .ARROW_RIGHT => editorMoveCursor(k),
+                EditorKey.PAGE_UP, EditorKey.PAGE_DOWN => {
+                    var times = E.win_size.rows;
+                    while (times > 0) : (times -= 1) {
+                        editorMoveCursor(if (k == EditorKey.PAGE_UP) EditorKey.ARROW_UP else EditorKey.ARROW_DOWN);
+                    }
+                },
+                .HOME_KEY => E.c.x = 0,
+                .END_KEY => E.c.x = E.win_size.cols - 1,
+                .DEL_KEY => {},
+            }
+        },
         else => {},
     }
     return true;
 }
 
-fn editorMoveCursor(key: u32) void {
+fn editorMoveCursor(key: EditorKey) void {
     switch (key) {
-        @intFromEnum(EditorKey.ARROW_UP) => E.c.y -|= 1,
-        @intFromEnum(EditorKey.ARROW_LEFT) => E.c.x -|= 1,
-        @intFromEnum(EditorKey.ARROW_DOWN) => {
+        .ARROW_UP => E.c.y -|= 1,
+        .ARROW_LEFT => E.c.x -|= 1,
+        .ARROW_DOWN => {
             if (E.c.y < E.win_size.rows) E.c.y += 1;
         },
-        @intFromEnum(EditorKey.ARROW_RIGHT) => {
+        .ARROW_RIGHT => {
             if (E.c.x < E.win_size.cols) E.c.x += 1;
         },
         else => {},
