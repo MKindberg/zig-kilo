@@ -5,16 +5,18 @@ const cLibs = @cImport({
 });
 
 // Constants
+const KILO_VERSION = "0.0.1";
 const STDOUT = std.io.getStdOut();
 const escape = struct {
     const esc = "\x1b";
     const clear_screen = esc ++ "[2J";
+    const clear_line = esc ++ "[K";
     const cursor_to_top = esc ++ "[H";
     const cursor_to_right = esc ++ "[999C";
     const cursor_to_bot = esc ++ "[999B";
     const get_cursor_pos = esc ++ "[6n";
-    const hide_cursor = esc ++ "?25l";
-    const show_cursor = esc ++ "?25h";
+    const hide_cursor = esc ++ "[?25l";
+    const show_cursor = esc ++ "[?25h";
 };
 const TermError = error{
     get_win_size_failed,
@@ -22,9 +24,18 @@ const TermError = error{
 
 // Structs
 const WindowSize = struct { rows: usize, cols: usize };
+const CursorPos = struct { x: usize, y: usize };
 const EditorConfig = struct {
     orig_termios: std.os.termios,
     win_size: WindowSize,
+    c: CursorPos,
+};
+
+const EditorKey = enum(u32) {
+    ARROW_LEFT = 1000,
+    ARROW_RIGHT,
+    ARROW_UP,
+    ARROW_DOWN,
 };
 
 // Globals
@@ -52,6 +63,7 @@ pub fn main() !void {
 }
 
 fn initEditor() !void {
+    E.c = CursorPos{ .x = 0, .y = 0 };
     E.win_size = try getWindowSize();
 }
 
@@ -67,7 +79,7 @@ fn enableRawMode() !void {
     raw.cflag |= (f.CS8);
     raw.lflag &= ~(f.ECHO | f.ICANON | f.IEXTEN | f.ISIG);
     raw.cc[f.V.MIN] = 0;
-    raw.cc[f.V.TIME] = 50;
+    raw.cc[f.V.TIME] = 1;
 
     try std.os.tcsetattr(std.io.getStdIn().handle, std.os.linux.TCSA.FLUSH, raw);
 }
@@ -75,9 +87,23 @@ fn disableRawMode() callconv(.C) void {
     std.os.tcsetattr(std.io.getStdIn().handle, std.os.linux.TCSA.FLUSH, E.orig_termios) catch std.debug.print("Could not reset terminal\r\n", .{});
 }
 
-fn editorReadKey() !u8 {
+fn editorReadKey() !u32 {
     var buf: [1]u8 = undefined;
     while (try std.io.getStdIn().read(buf[0..]) != 1) {}
+    if (buf[0] == escape.esc[0]) {
+        var seq: [2]u8 = undefined;
+        if (try std.io.getStdIn().read(seq[0..]) != 2) return buf[0];
+
+        if (seq[0] == '[') {
+            switch (seq[1]) {
+                'A' => return @intFromEnum(EditorKey.ARROW_UP),
+                'B' => return @intFromEnum(EditorKey.ARROW_DOWN),
+                'C' => return @intFromEnum(EditorKey.ARROW_RIGHT),
+                'D' => return @intFromEnum(EditorKey.ARROW_LEFT),
+                else => {},
+            }
+        }
+    }
     return buf[0];
 }
 
@@ -102,7 +128,7 @@ fn getCursorPosition() !WindowSize {
         if (buf[i] == 'R') break;
     }
 
-    if (buf[0] != '\x1b' or buf[1] != '[') return TermError.get_win_size_failed;
+    if (buf[0] != escape.esc[0] or buf[1] != '[') return TermError.get_win_size_failed;
     if (std.mem.indexOf(u8, buf[2..i], ";")) |delimiter| {
         const d = 2 + delimiter;
         return WindowSize{ .rows = try std.fmt.parseInt(usize, buf[2..d], 10), .cols = try std.fmt.parseInt(usize, buf[(d + 1)..i], 10) };
@@ -114,24 +140,35 @@ fn getCursorPosition() !WindowSize {
 // Output
 
 fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
-    _ = try STDOUT.write(escape.clear_screen);
-    _ = try STDOUT.write(escape.cursor_to_top);
-
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
 
-    try buf.appendslice(escape.hide_cursor);
-    try editorDrawRows(&buf);
+    try buf.appendSlice(escape.hide_cursor);
     try buf.appendSlice(escape.cursor_to_top);
+    try editorDrawRows(&buf);
+    try buf.writer().print(escape.esc ++ "[{};{}H", .{ E.c.y + 1, E.c.x + 1 });
     try buf.appendSlice(escape.show_cursor);
     _ = try STDOUT.write(buf.items);
 }
 fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
-    for (0..E.win_size.rows - 1) |_| {
-        try buf.appendSlice("~\r\n");
+    for (0..E.win_size.rows - 1) |y| {
+        if (y == E.win_size.rows / 3) {
+            const welcome = "Kilo editor -- version " ++ KILO_VERSION;
+            var padding = (E.win_size.cols - welcome.len) / 2;
+            if (padding > 0) {
+                try buf.append('~');
+                padding -= 1;
+            }
+            try buf.appendNTimes(' ', padding);
+            try buf.appendSlice(welcome[0..@min(welcome.len, E.win_size.cols)]);
+        } else {
+            try buf.append('~');
+        }
+        try buf.appendSlice(escape.clear_line);
+        try buf.appendSlice("\r\n");
     }
     try buf.append('~');
-    return buf;
+    try buf.appendSlice(escape.clear_line);
 }
 
 // Input
@@ -141,7 +178,22 @@ fn editorProcessKeyPress() !bool {
 
     switch (c) {
         ctrlKey('q') => return false,
+        @intFromEnum(EditorKey.ARROW_UP), @intFromEnum(EditorKey.ARROW_LEFT), @intFromEnum(EditorKey.ARROW_DOWN), @intFromEnum(EditorKey.ARROW_RIGHT) => editorMoveCursor(c),
         else => {},
     }
     return true;
+}
+
+fn editorMoveCursor(key: u32) void {
+    switch (key) {
+        @intFromEnum(EditorKey.ARROW_UP) => E.c.y -|= 1,
+        @intFromEnum(EditorKey.ARROW_LEFT) => E.c.x -|= 1,
+        @intFromEnum(EditorKey.ARROW_DOWN) => {
+            if (E.c.y < E.win_size.rows) E.c.y += 1;
+        },
+        @intFromEnum(EditorKey.ARROW_RIGHT) => {
+            if (E.c.x < E.win_size.cols) E.c.x += 1;
+        },
+        else => {},
+    }
 }
