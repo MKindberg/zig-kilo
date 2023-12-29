@@ -25,10 +25,16 @@ const TermError = error{
 // Structs
 const WindowSize = struct { rows: usize, cols: usize };
 const CursorPos = struct { x: usize, y: usize };
+// const EditorRow = struct {
+//     size: usize,
+//     chars: *u8,
+// };
 const EditorConfig = struct {
     orig_termios: std.os.termios,
     win_size: WindowSize,
     c: CursorPos,
+    num_rows: usize,
+    row: std.ArrayList(u8),
 };
 
 const EditorKey = enum(u32) {
@@ -60,6 +66,11 @@ pub fn main() !void {
     }
     try enableRawMode();
     try initEditor();
+    var args = std.process.args();
+    _ = args.skip();
+    if (args.next()) |filename| {
+        try editorOpen(allocator, filename);
+    }
 
     while (true) {
         try editorRefreshScreen(allocator);
@@ -70,6 +81,7 @@ pub fn main() !void {
 fn initEditor() !void {
     E.c = CursorPos{ .x = 0, .y = 0 };
     E.win_size = try getWindowSize();
+    E.num_rows = 0;
 }
 
 // Terminal
@@ -164,6 +176,19 @@ fn getCursorPosition() !WindowSize {
     return TermError.get_win_size_failed;
 }
 
+// File IO
+
+fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
+    var file = try std.fs.cwd().openFile(filename, .{});
+    defer file.close();
+    var buf: [1024]u8 = undefined;
+    var line = try file.reader().readUntilDelimiter(&buf, '\n');
+
+    E.row = @TypeOf(E.row).init(allocator);
+    try E.row.appendSlice(line);
+    E.num_rows = 1;
+}
+
 // Output
 
 fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
@@ -178,24 +203,27 @@ fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
     _ = try STDOUT.write(buf.items);
 }
 fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
-    for (0..E.win_size.rows - 1) |y| {
-        if (y == E.win_size.rows / 3) {
-            const welcome = "Kilo editor -- version " ++ KILO_VERSION;
-            var padding = (E.win_size.cols - welcome.len) / 2;
-            if (padding > 0) {
+    for (0..E.win_size.rows) |y| {
+        if (y >= E.num_rows) {
+            if (E.num_rows == 0 and y == E.win_size.rows / 3) {
+                const welcome = "Kilo editor -- version " ++ KILO_VERSION;
+                var padding = (E.win_size.cols - welcome.len) / 2;
+                if (padding > 0) {
+                    try buf.append('~');
+                    padding -= 1;
+                }
+                try buf.appendNTimes(' ', padding);
+                try buf.appendSlice(welcome[0..@min(welcome.len, E.win_size.cols)]);
+            } else {
                 try buf.append('~');
-                padding -= 1;
             }
-            try buf.appendNTimes(' ', padding);
-            try buf.appendSlice(welcome[0..@min(welcome.len, E.win_size.cols)]);
         } else {
-            try buf.append('~');
+            try buf.appendSlice(E.row.items[0..@min(E.row.items.len, E.win_size.cols)]);
         }
         try buf.appendSlice(escape.clear_line);
-        try buf.appendSlice("\r\n");
+        if (y < E.win_size.rows - 1)
+            try buf.appendSlice("\r\n");
     }
-    try buf.append('~');
-    try buf.appendSlice(escape.clear_line);
 }
 
 // Input
