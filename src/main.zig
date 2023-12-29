@@ -25,16 +25,12 @@ const TermError = error{
 // Structs
 const WindowSize = struct { rows: usize, cols: usize };
 const CursorPos = struct { x: usize, y: usize };
-// const EditorRow = struct {
-//     size: usize,
-//     chars: *u8,
-// };
 const EditorConfig = struct {
     orig_termios: std.os.termios,
     win_size: WindowSize,
     c: CursorPos,
-    num_rows: usize,
-    row: std.ArrayList(u8),
+    rows: std.ArrayList(std.ArrayList(u8)),
+    row_offset: usize,
 };
 
 const EditorKey = enum(u32) {
@@ -65,7 +61,7 @@ pub fn main() !void {
         _ = STDOUT.write(escape.cursor_to_top) catch {};
     }
     try enableRawMode();
-    try initEditor();
+    try initEditor(allocator);
     var args = std.process.args();
     _ = args.skip();
     if (args.next()) |filename| {
@@ -78,10 +74,11 @@ pub fn main() !void {
     }
 }
 
-fn initEditor() !void {
+fn initEditor(allocator: std.mem.Allocator) !void {
     E.c = CursorPos{ .x = 0, .y = 0 };
     E.win_size = try getWindowSize();
-    E.num_rows = 0;
+    E.rows = @TypeOf(E.rows).init(allocator);
+    E.row_offset = 0;
 }
 
 // Terminal
@@ -182,11 +179,11 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     var file = try std.fs.cwd().openFile(filename, .{});
     defer file.close();
     var buf: [1024]u8 = undefined;
-    var line = try file.reader().readUntilDelimiter(&buf, '\n');
-
-    E.row = @TypeOf(E.row).init(allocator);
-    try E.row.appendSlice(line);
-    E.num_rows = 1;
+    while (try file.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
+        var row = std.ArrayList(u8).init(allocator);
+        try row.appendSlice(line);
+        try E.rows.append(row);
+    }
 }
 
 // Output
@@ -204,8 +201,9 @@ fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
 }
 fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
     for (0..E.win_size.rows) |y| {
-        if (y >= E.num_rows) {
-            if (E.num_rows == 0 and y == E.win_size.rows / 3) {
+        var file_row = y + E.row_offset;
+        if (file_row >= E.rows.items.len) {
+            if (E.rows.items.len == 0 and y == E.win_size.rows / 3) {
                 const welcome = "Kilo editor -- version " ++ KILO_VERSION;
                 var padding = (E.win_size.cols - welcome.len) / 2;
                 if (padding > 0) {
@@ -218,7 +216,7 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
                 try buf.append('~');
             }
         } else {
-            try buf.appendSlice(E.row.items[0..@min(E.row.items.len, E.win_size.cols)]);
+            try buf.appendSlice(E.rows.items[file_row].items[0..@min(E.rows.items[file_row].items.len, E.win_size.cols)]);
         }
         try buf.appendSlice(escape.clear_line);
         if (y < E.win_size.rows - 1)
@@ -255,10 +253,12 @@ fn editorProcessKeyPress() !bool {
 
 fn editorMoveCursor(key: EditorKey) void {
     switch (key) {
-        .ARROW_UP => E.c.y -|= 1,
+        .ARROW_UP => {
+            if (E.c.y > 0) E.c.y -= 1 else if (E.row_offset > 0) E.row_offset -= 1;
+        },
         .ARROW_LEFT => E.c.x -|= 1,
         .ARROW_DOWN => {
-            if (E.c.y < E.win_size.rows) E.c.y += 1;
+            if (E.c.y < E.win_size.rows - 1) E.c.y += 1 else if (E.row_offset + E.c.y < E.rows.items.len) E.row_offset += 1;
         },
         .ARROW_RIGHT => {
             if (E.c.x < E.win_size.cols) E.c.x += 1;
