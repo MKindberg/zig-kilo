@@ -31,6 +31,7 @@ const EditorConfig = struct {
     c: CursorPos,
     rows: std.ArrayList(std.ArrayList(u8)),
     row_offset: usize,
+    col_offset: usize,
 };
 
 const EditorKey = enum(u32) {
@@ -79,6 +80,7 @@ fn initEditor(allocator: std.mem.Allocator) !void {
     E.win_size = try getWindowSize();
     E.rows = @TypeOf(E.rows).init(allocator);
     E.row_offset = 0;
+    E.col_offset = 0;
 }
 
 // Terminal
@@ -216,7 +218,10 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
                 try buf.append('~');
             }
         } else {
-            try buf.appendSlice(E.rows.items[file_row].items[0..@min(E.rows.items[file_row].items.len, E.win_size.cols)]);
+            var len = E.rows.items[file_row].items.len;
+            if (len > E.col_offset) len -= E.col_offset else len = 0;
+            if (len > 0)
+                try buf.appendSlice(E.rows.items[file_row].items[E.col_offset..(E.col_offset + @min(len, E.win_size.cols))]);
         }
         try buf.appendSlice(escape.clear_line);
         if (y < E.win_size.rows - 1)
@@ -256,13 +261,44 @@ fn editorMoveCursor(key: EditorKey) void {
         .ARROW_UP => {
             if (E.c.y > 0) E.c.y -= 1 else if (E.row_offset > 0) E.row_offset -= 1;
         },
-        .ARROW_LEFT => E.c.x -|= 1,
+        .ARROW_LEFT => {
+            if (E.c.x > 0) {
+                E.c.x -= 1;
+            } else if (E.col_offset > 0) {
+                E.col_offset -= 1;
+            } else if (E.c.y > 0) {
+                E.c.y -= 1;
+                E.c.x = E.rows.items[E.c.y + E.row_offset].items.len;
+            } else if (E.row_offset > 0) {
+                E.row_offset -= 1;
+                E.c.x = E.rows.items[E.c.y + E.row_offset].items.len;
+            }
+        },
         .ARROW_DOWN => {
             if (E.c.y < E.win_size.rows - 1) E.c.y += 1 else if (E.row_offset + E.c.y < E.rows.items.len) E.row_offset += 1;
         },
         .ARROW_RIGHT => {
-            if (E.c.x < E.win_size.cols) E.c.x += 1;
+            const row_len = if (E.c.y + E.row_offset < E.rows.items.len)
+                E.rows.items[E.c.y + E.row_offset].items.len
+            else
+                0;
+            if (E.c.x < E.win_size.cols - 1 and E.c.x < row_len) {
+                E.c.x += 1;
+            } else if (E.col_offset + E.c.x < row_len) {
+                E.col_offset += 1;
+            } else if (E.c.y < E.win_size.rows - 1) {
+                E.c.y += 1;
+                E.c.x = 0;
+            } else if (E.row_offset + E.c.y < E.rows.items.len) {
+                E.row_offset += 1;
+                E.c.x = 0;
+            }
         },
         else => {},
     }
+    const row_len = if (E.c.y + E.row_offset < E.rows.items.len)
+        E.rows.items[E.c.y + E.row_offset].items.len
+    else
+        0;
+    if (E.c.x > row_len) E.c.x = row_len;
 }
