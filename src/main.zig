@@ -6,6 +6,7 @@ const cLibs = @cImport({
 
 // Constants
 const KILO_VERSION = "0.0.1";
+const KILO_TAB_STOP = 8;
 const STDOUT = std.io.getStdOut();
 const escape = struct {
     const esc = "\x1b";
@@ -24,14 +25,35 @@ const TermError = error{
 
 // Structs
 const WindowSize = struct { rows: usize, cols: usize };
-const CursorPos = struct { x: usize, y: usize };
+const CursorPos = struct { x: usize, y: usize, rx: usize };
+const Row = struct {
+    row: std.ArrayList(u8),
+    render: std.ArrayList(u8),
+
+    const Self = @This();
+    fn init(allocator: std.mem.Allocator) Self {
+        return Self{
+            .row = std.ArrayList(u8).init(allocator),
+            .render = std.ArrayList(u8).init(allocator),
+        };
+    }
+};
 const EditorConfig = struct {
     orig_termios: std.os.termios,
     win_size: WindowSize,
     c: CursorPos,
-    rows: std.ArrayList(std.ArrayList(u8)),
+    rows: std.ArrayList(Row),
     row_offset: usize,
     col_offset: usize,
+
+    const Self = @This();
+    fn init(self: *Self, allocator: std.mem.Allocator) !void {
+        self.c = CursorPos{ .x = 0, .y = 0, .rx = 0 };
+        self.win_size = try getWindowSize();
+        self.rows = @TypeOf(E.rows).init(allocator);
+        self.row_offset = 0;
+        self.col_offset = 0;
+    }
 };
 
 const EditorKey = enum(u32) {
@@ -62,7 +84,7 @@ pub fn main() !void {
         _ = STDOUT.write(escape.cursor_to_top) catch {};
     }
     try enableRawMode();
-    try initEditor(allocator);
+    try E.init(allocator);
     var args = std.process.args();
     _ = args.skip();
     if (args.next()) |filename| {
@@ -73,14 +95,6 @@ pub fn main() !void {
         try editorRefreshScreen(allocator);
         if (!try editorProcessKeyPress()) break;
     }
-}
-
-fn initEditor(allocator: std.mem.Allocator) !void {
-    E.c = CursorPos{ .x = 0, .y = 0 };
-    E.win_size = try getWindowSize();
-    E.rows = @TypeOf(E.rows).init(allocator);
-    E.row_offset = 0;
-    E.col_offset = 0;
 }
 
 // Terminal
@@ -177,13 +191,26 @@ fn getCursorPosition() !WindowSize {
 
 // File IO
 
+fn editorUpdateRow(row: *Row) !void {
+    const tabs: usize = std.mem.count(u8, row.row.items, "\t");
+    try row.render.ensureTotalCapacity(row.row.items.len + tabs * (KILO_TAB_STOP - 1));
+    for (row.row.items) |c| {
+        if (c == '\t') {
+            row.render.appendSliceAssumeCapacity(" " ** KILO_TAB_STOP);
+        } else {
+            row.render.appendAssumeCapacity(c);
+        }
+    }
+}
+
 fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     var file = try std.fs.cwd().openFile(filename, .{});
     defer file.close();
     var buf: [1024]u8 = undefined;
     while (try file.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
-        var row = std.ArrayList(u8).init(allocator);
-        try row.appendSlice(line);
+        var row = Row.init(allocator);
+        try row.row.appendSlice(line);
+        try editorUpdateRow(&row);
         try E.rows.append(row);
     }
 }
@@ -191,13 +218,14 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
 // Output
 
 fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
+    editorScroll();
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
 
     try buf.appendSlice(escape.hide_cursor);
     try buf.appendSlice(escape.cursor_to_top);
     try editorDrawRows(&buf);
-    try buf.writer().print(escape.esc ++ "[{};{}H", .{ E.c.y + 1, E.c.x + 1 });
+    try buf.writer().print(escape.esc ++ "[{};{}H", .{ (E.c.y - E.col_offset) + 1, (E.c.rx - E.row_offset) + 1 });
     try buf.appendSlice(escape.show_cursor);
     _ = try STDOUT.write(buf.items);
 }
@@ -218,10 +246,10 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
                 try buf.append('~');
             }
         } else {
-            var len = E.rows.items[file_row].items.len;
+            var len = E.rows.items[file_row].render.items.len;
             if (len > E.col_offset) len -= E.col_offset else len = 0;
             if (len > 0)
-                try buf.appendSlice(E.rows.items[file_row].items[E.col_offset..(E.col_offset + @min(len, E.win_size.cols))]);
+                try buf.appendSlice(E.rows.items[file_row].render.items[E.col_offset..(E.col_offset + @min(len, E.win_size.cols))]);
         }
         try buf.appendSlice(escape.clear_line);
         if (y < E.win_size.rows - 1)
@@ -256,49 +284,70 @@ fn editorProcessKeyPress() !bool {
     return true;
 }
 
+fn editorRowCxToRx(row: *Row, cx: usize) usize {
+    var rx: usize = 0;
+    var j: usize = 0;
+    while (j < cx) : (j += 1) {
+        if (row.row.items[j] == '\t')
+            rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+        rx += 1;
+    }
+    return rx;
+}
+
+fn editorScroll() void {
+    E.c.rx = 0;
+    if (E.c.y < E.rows.items.len) {
+        E.c.rx = editorRowCxToRx(&E.rows.items[E.c.y], E.c.x);
+    }
+    if (E.c.y < E.row_offset) {
+        E.row_offset = E.c.y;
+    }
+    if (E.c.y >= E.row_offset + E.win_size.rows) {
+        E.row_offset = E.c.y - E.win_size.rows + 1;
+    }
+    if (E.c.rx < E.col_offset) {
+        E.col_offset = E.c.rx;
+    }
+    if (E.c.rx >= E.col_offset + E.win_size.cols) {
+        E.col_offset = E.c.rx - E.win_size.cols + 1;
+    }
+}
+
 fn editorMoveCursor(key: EditorKey) void {
+    var row: ?Row = if (E.c.y >= E.rows.items.len) null else E.rows.items[E.c.y];
     switch (key) {
-        .ARROW_UP => {
-            if (E.c.y > 0) E.c.y -= 1 else if (E.row_offset > 0) E.row_offset -= 1;
-        },
         .ARROW_LEFT => {
-            if (E.c.x > 0) {
+            if (E.c.x != 0) {
                 E.c.x -= 1;
-            } else if (E.col_offset > 0) {
-                E.col_offset -= 1;
             } else if (E.c.y > 0) {
                 E.c.y -= 1;
-                E.c.x = E.rows.items[E.c.y + E.row_offset].items.len;
-            } else if (E.row_offset > 0) {
-                E.row_offset -= 1;
-                E.c.x = E.rows.items[E.c.y + E.row_offset].items.len;
+                E.c.x = E.rows.items[E.c.y].row.items.len;
+            }
+        },
+        .ARROW_RIGHT => {
+            if (row != null and E.c.x < row.?.row.items.len) {
+                E.c.x += 1;
+            } else if (row != null and E.c.x == row.?.row.items.len) {
+                E.c.y += 1;
+                E.c.x = 0;
+            }
+        },
+        .ARROW_UP => {
+            if (E.c.y != 0) {
+                E.c.y -= 1;
             }
         },
         .ARROW_DOWN => {
-            if (E.c.y < E.win_size.rows - 1) E.c.y += 1 else if (E.row_offset + E.c.y < E.rows.items.len) E.row_offset += 1;
-        },
-        .ARROW_RIGHT => {
-            const row_len = if (E.c.y + E.row_offset < E.rows.items.len)
-                E.rows.items[E.c.y + E.row_offset].items.len
-            else
-                0;
-            if (E.c.x < E.win_size.cols - 1 and E.c.x < row_len) {
-                E.c.x += 1;
-            } else if (E.col_offset + E.c.x < row_len) {
-                E.col_offset += 1;
-            } else if (E.c.y < E.win_size.rows - 1) {
+            if (E.c.y < E.rows.items.len) {
                 E.c.y += 1;
-                E.c.x = 0;
-            } else if (E.row_offset + E.c.y < E.rows.items.len) {
-                E.row_offset += 1;
-                E.c.x = 0;
             }
         },
         else => {},
     }
-    const row_len = if (E.c.y + E.row_offset < E.rows.items.len)
-        E.rows.items[E.c.y + E.row_offset].items.len
-    else
-        0;
-    if (E.c.x > row_len) E.c.x = row_len;
+    row = if (E.c.y >= E.rows.items.len) null else E.rows.items[E.c.y];
+    var rowlen: usize = if (row != null) row.?.row.items.len else 0;
+    if (E.c.x > rowlen) {
+        E.c.x = rowlen;
+    }
 }
