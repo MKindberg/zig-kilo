@@ -225,7 +225,7 @@ fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
     try buf.appendSlice(escape.hide_cursor);
     try buf.appendSlice(escape.cursor_to_top);
     try editorDrawRows(&buf);
-    try buf.writer().print(escape.esc ++ "[{};{}H", .{ (E.c.y - E.col_offset) + 1, (E.c.rx - E.row_offset) + 1 });
+    try buf.writer().print(escape.esc ++ "[{};{}H", .{ (E.c.y - E.row_offset) + 1, (E.c.rx - E.col_offset) + 1 });
     try buf.appendSlice(escape.show_cursor);
     _ = try STDOUT.write(buf.items);
 }
@@ -268,14 +268,20 @@ fn editorProcessKeyPress() !bool {
             const k: EditorKey = @enumFromInt(c);
             switch (k) {
                 .ARROW_UP, .ARROW_LEFT, .ARROW_DOWN, .ARROW_RIGHT => editorMoveCursor(k),
-                EditorKey.PAGE_UP, EditorKey.PAGE_DOWN => {
+                .PAGE_UP, .PAGE_DOWN => {
+                    if (k == .PAGE_UP) {
+                        E.c.y = E.row_offset;
+                    } else {
+                        E.c.y = E.row_offset + E.win_size.rows - 1;
+                        if (E.c.y > E.rows.items.len) E.c.y = E.rows.items.len;
+                    }
                     var times = E.win_size.rows;
                     while (times > 0) : (times -= 1) {
                         editorMoveCursor(if (k == EditorKey.PAGE_UP) EditorKey.ARROW_UP else EditorKey.ARROW_DOWN);
                     }
                 },
                 .HOME_KEY => E.c.x = 0,
-                .END_KEY => E.c.x = E.win_size.cols - 1,
+                .END_KEY => E.c.x = if (E.c.y < E.rows.items.len) E.rows.items[E.c.y].row.items.len else 0,
                 .DEL_KEY => {},
             }
         },
