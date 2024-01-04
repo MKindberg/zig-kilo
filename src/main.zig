@@ -18,6 +18,8 @@ const escape = struct {
     const get_cursor_pos = esc ++ "[6n";
     const hide_cursor = esc ++ "[?25l";
     const show_cursor = esc ++ "[?25h";
+    const invert_colors = esc ++ "[7m";
+    const normal_colors = esc ++ "[m";
 };
 const TermError = error{
     get_win_size_failed,
@@ -45,6 +47,8 @@ const EditorConfig = struct {
     rows: std.ArrayList(Row),
     row_offset: usize,
     col_offset: usize,
+    filename: std.ArrayList(u8),
+    statusmsg: struct { msg: []u8, buf: [80]u8, time: i64 },
 
     const Self = @This();
     fn init(self: *Self, allocator: std.mem.Allocator) !void {
@@ -53,6 +57,11 @@ const EditorConfig = struct {
         self.rows = @TypeOf(E.rows).init(allocator);
         self.row_offset = 0;
         self.col_offset = 0;
+        self.filename = @TypeOf(E.filename).init(allocator);
+        self.statusmsg.msg = self.statusmsg.buf[0..0];
+        self.statusmsg.time = 0;
+
+        self.win_size.rows -= 2;
     }
 };
 
@@ -90,6 +99,8 @@ pub fn main() !void {
     if (args.next()) |filename| {
         try editorOpen(allocator, filename);
     }
+
+    try editorSetStatusMessage("HELP: Ctrl-Q = quit", .{});
 
     while (true) {
         try editorRefreshScreen(allocator);
@@ -204,6 +215,8 @@ fn editorUpdateRow(row: *Row) !void {
 }
 
 fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
+    E.filename.clearRetainingCapacity();
+    try E.filename.appendSlice(filename);
     var file = try std.fs.cwd().openFile(filename, .{});
     defer file.close();
     var buf: [1024]u8 = undefined;
@@ -225,6 +238,8 @@ fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
     try buf.appendSlice(escape.hide_cursor);
     try buf.appendSlice(escape.cursor_to_top);
     try editorDrawRows(&buf);
+    try editorDrawStatusBar(&buf);
+    try editorDrawMessageBar(&buf);
     try buf.writer().print(escape.esc ++ "[{};{}H", .{ (E.c.y - E.row_offset) + 1, (E.c.rx - E.col_offset) + 1 });
     try buf.appendSlice(escape.show_cursor);
     _ = try STDOUT.write(buf.items);
@@ -252,9 +267,42 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
                 try buf.appendSlice(E.rows.items[file_row].render.items[E.col_offset..(E.col_offset + @min(len, E.win_size.cols))]);
         }
         try buf.appendSlice(escape.clear_line);
-        if (y < E.win_size.rows - 1)
-            try buf.appendSlice("\r\n");
+        try buf.appendSlice("\r\n");
     }
+}
+
+fn editorDrawStatusBar(buf: *std.ArrayList(u8)) !void {
+    try buf.appendSlice(escape.invert_colors);
+
+    var status: [80]u8 = undefined;
+    var rstatus: [80]u8 = undefined;
+    const f = if (E.filename.items.len == 0) "[No Name]" else E.filename.items;
+    const len = (try std.fmt.bufPrint(&status, "{s} - {} lines", .{ f[0..@min(20, f.len)], E.rows.items.len })).len;
+    const rlen = (try std.fmt.bufPrint(&rstatus, "{}/{}", .{ E.c.y + 1, E.rows.items.len })).len;
+
+    try buf.appendSlice(status[0..@min(len, E.win_size.cols)]);
+    if (E.win_size.cols > len + rlen) {
+        try buf.appendNTimes(' ', E.win_size.cols - len - rlen);
+        try buf.appendSlice(rstatus[0..rlen]);
+    } else if (E.win_size.cols > len) {
+        try buf.appendNTimes(' ', E.win_size.cols - len);
+    }
+
+    try buf.appendSlice(escape.normal_colors);
+    try buf.appendSlice("\r\n");
+}
+
+fn editorDrawMessageBar(buf: *std.ArrayList(u8)) !void {
+    try buf.appendSlice(escape.clear_line);
+    const len = @min(E.statusmsg.msg.len, E.win_size.cols);
+    if(len > 0 and E.statusmsg.time > std.time.milliTimestamp() - 5000) {
+        try buf.appendSlice(E.statusmsg.msg[0..len]);
+    }
+}
+
+fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) !void {
+    E.statusmsg.msg = try std.fmt.bufPrint(&E.statusmsg.buf, fmt, args);
+    E.statusmsg.time = std.time.milliTimestamp();
 }
 
 // Input
