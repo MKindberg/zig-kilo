@@ -66,6 +66,7 @@ const EditorConfig = struct {
 };
 
 const EditorKey = enum(u32) {
+    BACKSPACE = 127,
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
@@ -75,6 +76,10 @@ const EditorKey = enum(u32) {
     DEL_KEY,
     PAGE_UP,
     PAGE_DOWN,
+
+    fn int(comptime self: EditorKey) u32 {
+        return @intFromEnum(self);
+    }
 };
 
 // Globals
@@ -100,11 +105,11 @@ pub fn main() !void {
         try editorOpen(allocator, filename);
     }
 
-    try editorSetStatusMessage("HELP: Ctrl-Q = quit", .{});
+    try editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit", .{});
 
     while (true) {
         try editorRefreshScreen(allocator);
-        if (!try editorProcessKeyPress()) break;
+        if (!try editorProcessKeyPress(allocator)) break;
     }
 }
 
@@ -200,11 +205,10 @@ fn getCursorPosition() !WindowSize {
     return TermError.get_win_size_failed;
 }
 
-// File IO
-
 fn editorUpdateRow(row: *Row) !void {
     const tabs: usize = std.mem.count(u8, row.row.items, "\t");
     try row.render.ensureTotalCapacity(row.row.items.len + tabs * (KILO_TAB_STOP - 1));
+    row.render.clearRetainingCapacity();
     for (row.row.items) |c| {
         if (c == '\t') {
             row.render.appendSliceAssumeCapacity(" " ** KILO_TAB_STOP);
@@ -213,6 +217,20 @@ fn editorUpdateRow(row: *Row) !void {
         }
     }
 }
+
+// Editor operations
+
+fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
+    if (E.c.y == E.rows.items.len) {
+        var row = Row.init(allocator);
+        try E.rows.append(row);
+    }
+    try E.rows.items[E.c.y].row.insert(E.c.x, c);
+    try editorUpdateRow(&E.rows.items[E.c.y]);
+    E.c.x += 1;
+}
+
+// File IO
 
 fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     E.filename.clearRetainingCapacity();
@@ -226,6 +244,28 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
         try editorUpdateRow(&row);
         try E.rows.append(row);
     }
+}
+
+fn editorSave(allocator: std.mem.Allocator) !void {
+    if (E.filename.items.len == 0) return;
+
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    for (E.rows.items) |row| {
+        try buf.writer().print("{s}\n", .{row.row.items});
+    }
+
+    var file = std.fs.cwd().openFile(E.filename.items, .{ .mode = .write_only }) catch |e| {
+        try editorSetStatusMessage("Failed to open file: {}", .{e});
+        return;
+    };
+    defer file.close();
+
+    file.writer().print("{s}", .{buf.items}) catch |e| {
+        try editorSetStatusMessage("Failed to write to file: {}", .{e});
+        return;
+    };
+    try editorSetStatusMessage("{} bytes written to disk", .{buf.items.len});
 }
 
 // Output
@@ -295,7 +335,7 @@ fn editorDrawStatusBar(buf: *std.ArrayList(u8)) !void {
 fn editorDrawMessageBar(buf: *std.ArrayList(u8)) !void {
     try buf.appendSlice(escape.clear_line);
     const len = @min(E.statusmsg.msg.len, E.win_size.cols);
-    if(len > 0 and E.statusmsg.time > std.time.milliTimestamp() - 5000) {
+    if (len > 0 and E.statusmsg.time > std.time.milliTimestamp() - 5000) {
         try buf.appendSlice(E.statusmsg.msg[0..len]);
     }
 }
@@ -307,33 +347,37 @@ fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) !void {
 
 // Input
 
-fn editorProcessKeyPress() !bool {
+fn asInt(comptime k: EditorKey) u32 {
+    return @intFromEnum(k);
+}
+fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
     const c = try editorReadKey();
 
     switch (c) {
+        '\r' => {}, //TODO
         ctrlKey('q') => return false,
-        1000...1000 + std.enums.values(EditorKey).len => {
+        ctrlKey('s') => try editorSave(allocator),
+        asInt(.DEL_KEY), asInt(.BACKSPACE), ctrlKey('h') => {}, //TODO
+        ctrlKey('l'), escape.esc[0] => {},
+        asInt(.ARROW_UP), asInt(.ARROW_LEFT), asInt(.ARROW_DOWN), asInt(.ARROW_RIGHT) => editorMoveCursor(@enumFromInt(c)),
+        asInt(.PAGE_UP), asInt(.PAGE_DOWN) => {
             const k: EditorKey = @enumFromInt(c);
-            switch (k) {
-                .ARROW_UP, .ARROW_LEFT, .ARROW_DOWN, .ARROW_RIGHT => editorMoveCursor(k),
-                .PAGE_UP, .PAGE_DOWN => {
-                    if (k == .PAGE_UP) {
-                        E.c.y = E.row_offset;
-                    } else {
-                        E.c.y = E.row_offset + E.win_size.rows - 1;
-                        if (E.c.y > E.rows.items.len) E.c.y = E.rows.items.len;
-                    }
-                    var times = E.win_size.rows;
-                    while (times > 0) : (times -= 1) {
-                        editorMoveCursor(if (k == EditorKey.PAGE_UP) EditorKey.ARROW_UP else EditorKey.ARROW_DOWN);
-                    }
-                },
-                .HOME_KEY => E.c.x = 0,
-                .END_KEY => E.c.x = if (E.c.y < E.rows.items.len) E.rows.items[E.c.y].row.items.len else 0,
-                .DEL_KEY => {},
+            if (k == .PAGE_UP) {
+                E.c.y = E.row_offset;
+            } else {
+                E.c.y = E.row_offset + E.win_size.rows - 1;
+                if (E.c.y > E.rows.items.len) E.c.y = E.rows.items.len;
+            }
+            var times = E.win_size.rows;
+            while (times > 0) : (times -= 1) {
+                editorMoveCursor(if (k == EditorKey.PAGE_UP) EditorKey.ARROW_UP else EditorKey.ARROW_DOWN);
             }
         },
-        else => {},
+        asInt(.HOME_KEY) => E.c.x = 0,
+        asInt(.END_KEY) => E.c.x = if (E.c.y < E.rows.items.len) E.rows.items[E.c.y].row.items.len else 0,
+        else => {
+            try editorInsertChar(allocator, @intCast(c));
+        },
     }
     return true;
 }
