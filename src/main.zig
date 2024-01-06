@@ -7,6 +7,7 @@ const cLibs = @cImport({
 // Constants
 const KILO_VERSION = "0.0.1";
 const KILO_TAB_STOP = 8;
+const KILO_QUIT_TIMES = 3;
 const STDOUT = std.io.getStdOut();
 const escape = struct {
     const esc = "\x1b";
@@ -49,6 +50,7 @@ const EditorConfig = struct {
     col_offset: usize,
     filename: std.ArrayList(u8),
     statusmsg: struct { msg: []u8, buf: [80]u8, time: i64 },
+    dirty: bool,
 
     const Self = @This();
     fn init(self: *Self, allocator: std.mem.Allocator) !void {
@@ -60,6 +62,7 @@ const EditorConfig = struct {
         self.filename = @TypeOf(E.filename).init(allocator);
         self.statusmsg.msg = self.statusmsg.buf[0..0];
         self.statusmsg.time = 0;
+        self.dirty = false;
 
         self.win_size.rows -= 2;
     }
@@ -228,6 +231,7 @@ fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
     try E.rows.items[E.c.y].row.insert(E.c.x, c);
     try editorUpdateRow(&E.rows.items[E.c.y]);
     E.c.x += 1;
+    E.dirty = true;
 }
 
 // File IO
@@ -265,6 +269,7 @@ fn editorSave(allocator: std.mem.Allocator) !void {
         try editorSetStatusMessage("Failed to write to file: {}", .{e});
         return;
     };
+    E.dirty = false;
     try editorSetStatusMessage("{} bytes written to disk", .{buf.items.len});
 }
 
@@ -317,7 +322,8 @@ fn editorDrawStatusBar(buf: *std.ArrayList(u8)) !void {
     var status: [80]u8 = undefined;
     var rstatus: [80]u8 = undefined;
     const f = if (E.filename.items.len == 0) "[No Name]" else E.filename.items;
-    const len = (try std.fmt.bufPrint(&status, "{s} - {} lines", .{ f[0..@min(20, f.len)], E.rows.items.len })).len;
+    const dirty = if (E.dirty) "(modified)" else "";
+    const len = (try std.fmt.bufPrint(&status, "{s} - {} lines {s}", .{ f[0..@min(20, f.len)], E.rows.items.len, dirty })).len;
     const rlen = (try std.fmt.bufPrint(&rstatus, "{}/{}", .{ E.c.y + 1, E.rows.items.len })).len;
 
     try buf.appendSlice(status[0..@min(len, E.win_size.cols)]);
@@ -351,11 +357,23 @@ fn asInt(comptime k: EditorKey) u32 {
     return @intFromEnum(k);
 }
 fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
+    const Static = struct {
+        var quit_times: usize = KILO_QUIT_TIMES;
+    };
     const c = try editorReadKey();
 
     switch (c) {
         '\r' => {}, //TODO
-        ctrlKey('q') => return false,
+        ctrlKey('q') => {
+            if (E.dirty) {
+                if (Static.quit_times > 0) {
+                    try editorSetStatusMessage("WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.", .{Static.quit_times});
+                    Static.quit_times -= 1;
+                    return true;
+                }
+            }
+            return false;
+        },
         ctrlKey('s') => try editorSave(allocator),
         asInt(.DEL_KEY), asInt(.BACKSPACE), ctrlKey('h') => {}, //TODO
         ctrlKey('l'), escape.esc[0] => {},
@@ -379,6 +397,7 @@ fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
             try editorInsertChar(allocator, @intCast(c));
         },
     }
+    Static.quit_times = KILO_QUIT_TIMES;
     return true;
 }
 
