@@ -40,6 +40,10 @@ const Row = struct {
             .render = std.ArrayList(u8).init(allocator),
         };
     }
+    fn deinit(self: *Self) void {
+        self.row.deinit();
+        self.render.deinit();
+    }
 };
 const EditorConfig = struct {
     orig_termios: std.os.termios,
@@ -234,6 +238,24 @@ fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
     E.dirty = true;
 }
 
+fn editorDelChar() !void {
+    if (E.c.y == E.rows.items.len) return;
+
+    if (E.c.x > 0) {
+        _ = E.rows.items[E.c.y].row.orderedRemove(E.c.x - 1);
+        E.dirty = true;
+        E.c.x -= 1;
+        try editorUpdateRow(&E.rows.items[E.c.y]);
+    } else if (E.c.y > 0) {
+        try E.rows.items[E.c.y - 1].row.appendSlice(E.rows.items[E.c.y].row.items);
+        E.rows.items[E.c.y].deinit();
+        _ = E.rows.orderedRemove(E.c.y);
+        E.dirty = true;
+        E.c.y -= 1;
+        try editorUpdateRow(&E.rows.items[E.c.y]);
+    }
+}
+
 // File IO
 
 fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
@@ -375,7 +397,12 @@ fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
             return false;
         },
         ctrlKey('s') => try editorSave(allocator),
-        asInt(.DEL_KEY), asInt(.BACKSPACE), ctrlKey('h') => {}, //TODO
+        asInt(.DEL_KEY), asInt(.BACKSPACE), ctrlKey('h') => {
+            if (c == asInt(.DEL_KEY)) {
+                editorMoveCursor(.ARROW_RIGHT);
+            }
+            try editorDelChar();
+        },
         ctrlKey('l'), escape.esc[0] => {},
         asInt(.ARROW_UP), asInt(.ARROW_LEFT), asInt(.ARROW_DOWN), asInt(.ARROW_RIGHT) => editorMoveCursor(@enumFromInt(c)),
         asInt(.PAGE_UP), asInt(.PAGE_DOWN) => {
