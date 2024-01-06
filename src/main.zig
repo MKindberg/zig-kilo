@@ -30,18 +30,18 @@ const TermError = error{
 const WindowSize = struct { rows: usize, cols: usize };
 const CursorPos = struct { x: usize, y: usize, rx: usize };
 const Row = struct {
-    row: std.ArrayList(u8),
+    chars: std.ArrayList(u8),
     render: std.ArrayList(u8),
 
     const Self = @This();
     fn init(allocator: std.mem.Allocator) Self {
         return Self{
-            .row = std.ArrayList(u8).init(allocator),
+            .chars = std.ArrayList(u8).init(allocator),
             .render = std.ArrayList(u8).init(allocator),
         };
     }
     fn deinit(self: *Self) void {
-        self.row.deinit();
+        self.chars.deinit();
         self.render.deinit();
     }
 };
@@ -112,7 +112,7 @@ pub fn main() !void {
         try editorOpen(allocator, filename);
     }
 
-    try editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit", .{});
+    try editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find", .{});
 
     while (true) {
         try editorRefreshScreen(allocator);
@@ -213,10 +213,10 @@ fn getCursorPosition() !WindowSize {
 }
 
 fn editorUpdateRow(row: *Row) !void {
-    const tabs: usize = std.mem.count(u8, row.row.items, "\t");
-    try row.render.ensureTotalCapacity(row.row.items.len + tabs * (KILO_TAB_STOP - 1));
+    const tabs: usize = std.mem.count(u8, row.chars.items, "\t");
+    try row.render.ensureTotalCapacity(row.chars.items.len + tabs * (KILO_TAB_STOP - 1));
     row.render.clearRetainingCapacity();
-    for (row.row.items) |c| {
+    for (row.chars.items) |c| {
         if (c == '\t') {
             row.render.appendSliceAssumeCapacity(" " ** KILO_TAB_STOP);
         } else {
@@ -231,7 +231,7 @@ fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
     if (E.c.y == E.rows.items.len) {
         try E.rows.append(Row.init(allocator));
     }
-    try E.rows.items[E.c.y].row.insert(E.c.x, c);
+    try E.rows.items[E.c.y].chars.insert(E.c.x, c);
     try editorUpdateRow(&E.rows.items[E.c.y]);
     E.c.x += 1;
     E.dirty = true;
@@ -242,10 +242,10 @@ fn editorInsertNewline(allocator: std.mem.Allocator) !void {
         try E.rows.insert(E.c.y, Row.init(allocator));
     } else {
         var row = Row.init(allocator);
-        try row.row.appendSlice(E.rows.items[E.c.y].row.items[E.c.x..]);
+        try row.chars.appendSlice(E.rows.items[E.c.y].chars.items[E.c.x..]);
         try E.rows.insert(E.c.y + 1, row);
         try editorUpdateRow(&E.rows.items[E.c.y + 1]);
-        try E.rows.items[E.c.y].row.resize(E.c.x);
+        try E.rows.items[E.c.y].chars.resize(E.c.x);
         try editorUpdateRow(&E.rows.items[E.c.y]);
     }
     E.c.y += 1;
@@ -257,12 +257,12 @@ fn editorDelChar() !void {
     if (E.c.y == E.rows.items.len) return;
 
     if (E.c.x > 0) {
-        _ = E.rows.items[E.c.y].row.orderedRemove(E.c.x - 1);
+        _ = E.rows.items[E.c.y].chars.orderedRemove(E.c.x - 1);
         E.dirty = true;
         E.c.x -= 1;
         try editorUpdateRow(&E.rows.items[E.c.y]);
     } else if (E.c.y > 0) {
-        try E.rows.items[E.c.y - 1].row.appendSlice(E.rows.items[E.c.y].row.items);
+        try E.rows.items[E.c.y - 1].chars.appendSlice(E.rows.items[E.c.y].chars.items);
         E.rows.items[E.c.y].deinit();
         _ = E.rows.orderedRemove(E.c.y);
         E.dirty = true;
@@ -281,7 +281,7 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     var buf: [1024]u8 = undefined;
     while (try file.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
         var row = Row.init(allocator);
-        try row.row.appendSlice(line);
+        try row.chars.appendSlice(line);
         try editorUpdateRow(&row);
         try E.rows.append(row);
     }
@@ -290,7 +290,7 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
 fn editorSave(allocator: std.mem.Allocator) !void {
     if (E.filename.items.len == 0) {
         E.filename.deinit();
-        E.filename = try editorPrompt(allocator, "Save as: {s}");
+        E.filename = try editorPrompt(allocator, "Save as: {s} (ESC to cancel)", null);
         if (E.filename.items.len == 0) {
             try editorSetStatusMessage("Save aborted", .{});
             return;
@@ -300,7 +300,7 @@ fn editorSave(allocator: std.mem.Allocator) !void {
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
     for (E.rows.items) |row| {
-        try buf.writer().print("{s}\n", .{row.row.items});
+        try buf.writer().print("{s}\n", .{row.chars.items});
     }
 
     var file = std.fs.cwd().createFile(E.filename.items, .{ .read = true, .truncate = true, .mode = 0o664 }) catch |e| {
@@ -315,6 +315,61 @@ fn editorSave(allocator: std.mem.Allocator) !void {
     };
     E.dirty = false;
     try editorSetStatusMessage("{} bytes written to disk", .{buf.items.len});
+}
+
+// Find
+
+fn editorFindCallback(query: []u8, key: u32) void {
+    const Static = struct {
+        var last_match: i32 = -1;
+        var direction: i32 = 1;
+    };
+    if (key == '\r' or key == escape.esc[0]) {
+        Static.last_match = -1;
+        Static.direction = 1;
+        editorSetStatusMessage("", .{}) catch {};
+        return;
+    } else if (key == asInt(.ARROW_RIGHT) or key == asInt(.ARROW_DOWN)) {
+        Static.direction = 1;
+    } else if (key == asInt(.ARROW_LEFT) or key == asInt(.ARROW_UP)) {
+        Static.direction = -1;
+    } else {
+        Static.last_match = -1;
+        Static.direction = 1;
+    }
+
+    if (Static.last_match == -1) Static.direction = 1;
+    var current = Static.last_match;
+
+    for (0..E.rows.items.len) |_| {
+        current += Static.direction;
+        if (current == -1) current = @intCast(E.rows.items.len - 1) else if (current == E.rows.items.len) current = 0;
+
+        var row = E.rows.items[@as(usize, @intCast(current))];
+        if (std.mem.indexOf(u8, row.render.items, query)) |pos| {
+            Static.last_match = current;
+            E.c.y = @intCast(current);
+            E.c.x = editorRowRxToCx(row, pos);
+            E.row_offset = E.rows.items.len;
+            break;
+        }
+    }
+}
+
+fn editorFind(allocator: std.mem.Allocator) !void {
+    const saved_cx = E.c.x;
+    const saved_cy = E.c.y;
+    const saved_coloff = E.col_offset;
+    const saved_rowoff = E.row_offset;
+    const query = try editorPrompt(allocator, "Search: {s} (Use ESC/Arrows/Enter)", editorFindCallback);
+    defer query.deinit();
+
+    if (query.items.len == 0) {
+        E.c.x = saved_cx;
+        E.c.y = saved_cy;
+        E.col_offset = saved_coloff;
+        E.row_offset = saved_rowoff;
+    }
 }
 
 // Output
@@ -400,15 +455,19 @@ fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) !void {
 fn asInt(comptime k: EditorKey) u32 {
     return @intFromEnum(k);
 }
-fn editorPrompt(allocator: std.mem.Allocator, comptime prompt: []const u8) !std.ArrayList(u8) {
+fn editorPrompt(allocator: std.mem.Allocator, comptime prompt: []const u8, comptime callback: ?fn ([]u8, u32) void) !std.ArrayList(u8) {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
+
+    var c: u32 = undefined;
+    defer if (callback) |func| func(buf.items, c);
 
     while (true) {
         try editorSetStatusMessage(prompt, .{buf.items});
         try editorRefreshScreen(allocator);
 
-        var c = try editorReadKey();
+        c = try editorReadKey();
+
         if (c == asInt(.DEL_KEY) or c == asInt(.BACKSPACE) or c == ctrlKey('h')) {
             _ = buf.popOrNull();
         } else if (c == escape.esc[0]) {
@@ -422,6 +481,7 @@ fn editorPrompt(allocator: std.mem.Allocator, comptime prompt: []const u8) !std.
         } else if (c < 128 and !std.ascii.isControl(@intCast(c))) {
             try buf.append(@intCast(c));
         }
+        if (callback) |func| func(buf.items, c);
     }
 }
 
@@ -446,6 +506,7 @@ fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
             return false;
         },
         ctrlKey('s') => try editorSave(allocator),
+        ctrlKey('f') => try editorFind(allocator),
         asInt(.DEL_KEY), asInt(.BACKSPACE), ctrlKey('h') => {
             if (c == asInt(.DEL_KEY)) {
                 editorMoveCursor(.ARROW_RIGHT);
@@ -468,7 +529,7 @@ fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
             }
         },
         asInt(.HOME_KEY) => E.c.x = 0,
-        asInt(.END_KEY) => E.c.x = if (E.c.y < E.rows.items.len) E.rows.items[E.c.y].row.items.len else 0,
+        asInt(.END_KEY) => E.c.x = if (E.c.y < E.rows.items.len) E.rows.items[E.c.y].chars.items.len else 0,
         else => {
             try editorInsertChar(allocator, @intCast(c));
         },
@@ -481,11 +542,21 @@ fn editorRowCxToRx(row: *Row, cx: usize) usize {
     var rx: usize = 0;
     var j: usize = 0;
     while (j < cx) : (j += 1) {
-        if (row.row.items[j] == '\t')
+        if (row.chars.items[j] == '\t')
             rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
         rx += 1;
     }
     return rx;
+}
+
+fn editorRowRxToCx(row: Row, rx: usize) usize {
+    var cur_rx: usize = 0;
+    for (row.chars.items, 0..) |c, cx| {
+        if (c == '\t') cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
+        cur_rx += 1;
+        if (cur_rx > rx) return cx;
+    }
+    return row.chars.items.len;
 }
 
 fn editorScroll() void {
@@ -515,13 +586,13 @@ fn editorMoveCursor(key: EditorKey) void {
                 E.c.x -= 1;
             } else if (E.c.y > 0) {
                 E.c.y -= 1;
-                E.c.x = E.rows.items[E.c.y].row.items.len;
+                E.c.x = E.rows.items[E.c.y].chars.items.len;
             }
         },
         .ARROW_RIGHT => {
-            if (row != null and E.c.x < row.?.row.items.len) {
+            if (row != null and E.c.x < row.?.chars.items.len) {
                 E.c.x += 1;
-            } else if (row != null and E.c.x == row.?.row.items.len) {
+            } else if (row != null and E.c.x == row.?.chars.items.len) {
                 E.c.y += 1;
                 E.c.x = 0;
             }
@@ -539,7 +610,7 @@ fn editorMoveCursor(key: EditorKey) void {
         else => {},
     }
     row = if (E.c.y >= E.rows.items.len) null else E.rows.items[E.c.y];
-    var rowlen: usize = if (row != null) row.?.row.items.len else 0;
+    var rowlen: usize = if (row != null) row.?.chars.items.len else 0;
     if (E.c.x > rowlen) {
         E.c.x = rowlen;
     }
