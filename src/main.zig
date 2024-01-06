@@ -229,12 +229,27 @@ fn editorUpdateRow(row: *Row) !void {
 
 fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
     if (E.c.y == E.rows.items.len) {
-        var row = Row.init(allocator);
-        try E.rows.append(row);
+        try E.rows.append(Row.init(allocator));
     }
     try E.rows.items[E.c.y].row.insert(E.c.x, c);
     try editorUpdateRow(&E.rows.items[E.c.y]);
     E.c.x += 1;
+    E.dirty = true;
+}
+
+fn editorInsertNewline(allocator: std.mem.Allocator) !void {
+    if (E.c.x == 0) {
+        try E.rows.insert(E.c.y, Row.init(allocator));
+    } else {
+        var row = Row.init(allocator);
+        try row.row.appendSlice(E.rows.items[E.c.y].row.items[E.c.x..]);
+        try E.rows.insert(E.c.y + 1, row);
+        try editorUpdateRow(&E.rows.items[E.c.y + 1]);
+        try E.rows.items[E.c.y].row.resize(E.c.x);
+        try editorUpdateRow(&E.rows.items[E.c.y]);
+    }
+    E.c.y += 1;
+    E.c.x = 0;
     E.dirty = true;
 }
 
@@ -273,7 +288,14 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
 }
 
 fn editorSave(allocator: std.mem.Allocator) !void {
-    if (E.filename.items.len == 0) return;
+    if (E.filename.items.len == 0) {
+        E.filename.deinit();
+        E.filename = try editorPrompt(allocator, "Save as: {s}");
+        if (E.filename.items.len == 0) {
+            try editorSetStatusMessage("Save aborted", .{});
+            return;
+        }
+    }
 
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
@@ -281,7 +303,7 @@ fn editorSave(allocator: std.mem.Allocator) !void {
         try buf.writer().print("{s}\n", .{row.row.items});
     }
 
-    var file = std.fs.cwd().openFile(E.filename.items, .{ .mode = .write_only }) catch |e| {
+    var file = std.fs.cwd().createFile(E.filename.items, .{ .read = true, .truncate = true, .mode = 0o664 }) catch |e| {
         try editorSetStatusMessage("Failed to open file: {}", .{e});
         return;
     };
@@ -299,6 +321,7 @@ fn editorSave(allocator: std.mem.Allocator) !void {
 
 fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
     editorScroll();
+
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
 
@@ -374,10 +397,34 @@ fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) !void {
 }
 
 // Input
-
 fn asInt(comptime k: EditorKey) u32 {
     return @intFromEnum(k);
 }
+fn editorPrompt(allocator: std.mem.Allocator, comptime prompt: []const u8) !std.ArrayList(u8) {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+
+    while (true) {
+        try editorSetStatusMessage(prompt, .{buf.items});
+        try editorRefreshScreen(allocator);
+
+        var c = try editorReadKey();
+        if (c == asInt(.DEL_KEY) or c == asInt(.BACKSPACE) or c == ctrlKey('h')) {
+            _ = buf.popOrNull();
+        } else if (c == escape.esc[0]) {
+            buf.clearAndFree();
+            return buf;
+        } else if (c == '\r') {
+            if (buf.items.len != 0) {
+                try editorSetStatusMessage("", .{});
+                return buf;
+            }
+        } else if (c < 128 and !std.ascii.isControl(@intCast(c))) {
+            try buf.append(@intCast(c));
+        }
+    }
+}
+
 fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
     const Static = struct {
         var quit_times: usize = KILO_QUIT_TIMES;
@@ -385,7 +432,9 @@ fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
     const c = try editorReadKey();
 
     switch (c) {
-        '\r' => {}, //TODO
+        '\r' => {
+            try editorInsertNewline(allocator);
+        },
         ctrlKey('q') => {
             if (E.dirty) {
                 if (Static.quit_times > 0) {
