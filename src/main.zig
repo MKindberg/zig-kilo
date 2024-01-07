@@ -20,7 +20,9 @@ const escape = struct {
     const hide_cursor = esc ++ "[?25l";
     const show_cursor = esc ++ "[?25h";
     const invert_colors = esc ++ "[7m";
-    const normal_colors = esc ++ "[m";
+    const normal_text = esc ++ "[m";
+    const color_red = esc ++ "[31m";
+    const color_reset = esc ++ "[39m";
 };
 const TermError = error{
     get_win_size_failed,
@@ -29,20 +31,27 @@ const TermError = error{
 // Structs
 const WindowSize = struct { rows: usize, cols: usize };
 const CursorPos = struct { x: usize, y: usize, rx: usize };
+const EditorHighlight = enum(u8) {
+    NORMAL = 0,
+    NUMBER,
+};
 const Row = struct {
     chars: std.ArrayList(u8),
     render: std.ArrayList(u8),
+    hl: std.ArrayList(EditorHighlight),
 
     const Self = @This();
     fn init(allocator: std.mem.Allocator) Self {
         return Self{
             .chars = std.ArrayList(u8).init(allocator),
             .render = std.ArrayList(u8).init(allocator),
+            .hl = std.ArrayList(EditorHighlight).init(allocator),
         };
     }
     fn deinit(self: *Self) void {
         self.chars.deinit();
         self.render.deinit();
+        self.hl.deinit();
     }
 };
 const EditorConfig = struct {
@@ -212,6 +221,27 @@ fn getCursorPosition() !WindowSize {
     return TermError.get_win_size_failed;
 }
 
+// Syntax highlighting
+
+fn editorUpdateSyntax(row: *Row) !void {
+    try row.hl.appendNTimes(EditorHighlight.NORMAL, row.render.items.len);
+
+    for (row.render.items, 0..) |c, i| {
+        if (std.ascii.isDigit(c)) {
+            row.hl.items[i] = .NUMBER;
+        }
+    }
+}
+
+fn editorSyntaxToColor(hl: EditorHighlight) []const u8 {
+    switch (hl) {
+        .NORMAL => return escape.color_reset,
+        .NUMBER => return escape.color_red,
+    }
+}
+
+// Row operations
+
 fn editorUpdateRow(row: *Row) !void {
     const tabs: usize = std.mem.count(u8, row.chars.items, "\t");
     try row.render.ensureTotalCapacity(row.chars.items.len + tabs * (KILO_TAB_STOP - 1));
@@ -223,6 +253,7 @@ fn editorUpdateRow(row: *Row) !void {
             row.render.appendAssumeCapacity(c);
         }
     }
+    try editorUpdateSyntax(row);
 }
 
 // Editor operations
@@ -406,10 +437,23 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
                 try buf.append('~');
             }
         } else {
+            const hl = E.rows.items[file_row].hl.items;
             var len = E.rows.items[file_row].render.items.len;
             if (len > E.col_offset) len -= E.col_offset else len = 0;
-            if (len > 0)
-                try buf.appendSlice(E.rows.items[file_row].render.items[E.col_offset..(E.col_offset + @min(len, E.win_size.cols))]);
+            var current_color = EditorHighlight.NORMAL;
+            for (E.col_offset..(E.col_offset + @min(len, E.win_size.cols))) |i| {
+                if (hl[i] == .NORMAL and current_color != .NORMAL) {
+                    try buf.appendSlice(escape.color_reset);
+                    current_color = .NORMAL;
+                } else {
+                    if (hl[i] != current_color) {
+                        try buf.appendSlice(editorSyntaxToColor(hl[i]));
+                        current_color = hl[i];
+                    }
+                }
+                try buf.append(E.rows.items[file_row].render.items[i]);
+            }
+            try buf.appendSlice(escape.color_reset);
         }
         try buf.appendSlice(escape.clear_line);
         try buf.appendSlice("\r\n");
@@ -434,7 +478,7 @@ fn editorDrawStatusBar(buf: *std.ArrayList(u8)) !void {
         try buf.appendNTimes(' ', E.win_size.cols - len);
     }
 
-    try buf.appendSlice(escape.normal_colors);
+    try buf.appendSlice(escape.normal_text);
     try buf.appendSlice("\r\n");
 }
 
