@@ -11,7 +11,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe.linkLibC(); // There doesn't seem to be anything corresponding to atexit in the zig std.
 
     b.installArtifact(exe);
 

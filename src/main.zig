@@ -1,8 +1,4 @@
 const std = @import("std");
-const cLibs = @cImport({
-    @cInclude("stdlib.h");
-    @cInclude("termios.h");
-});
 
 // Constants
 const KILO_VERSION = "0.0.1";
@@ -171,6 +167,7 @@ pub fn main() !void {
         _ = STDOUT.write(escape.cursor_to_top) catch {};
     }
     try enableRawMode();
+    defer disableRawMode();
     try E.init(allocator);
     var args = std.process.args();
     _ = args.skip();
@@ -189,7 +186,6 @@ pub fn main() !void {
 // Terminal
 fn enableRawMode() !void {
     E.orig_termios = try std.os.tcgetattr(std.io.getStdIn().handle);
-    _ = cLibs.atexit(disableRawMode);
     var raw = E.orig_termios;
 
     const f = std.os.linux;
