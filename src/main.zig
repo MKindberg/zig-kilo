@@ -21,8 +21,11 @@ const escape = struct {
     const show_cursor = esc ++ "[?25h";
     const invert_colors = esc ++ "[7m";
     const normal_text = esc ++ "[m";
-    const color_red = esc ++ "[31m";
-    const color_reset = esc ++ "[39m";
+    const color = struct {
+        const red = esc ++ "[31m";
+        const blue = esc ++ "[34m";
+        const reset = esc ++ "[39m";
+    };
 };
 const TermError = error{
     get_win_size_failed,
@@ -34,6 +37,7 @@ const CursorPos = struct { x: usize, y: usize, rx: usize };
 const EditorHighlight = enum(u8) {
     NORMAL = 0,
     NUMBER,
+    MATCH,
 };
 const Row = struct {
     chars: std.ArrayList(u8),
@@ -235,8 +239,9 @@ fn editorUpdateSyntax(row: *Row) !void {
 
 fn editorSyntaxToColor(hl: EditorHighlight) []const u8 {
     switch (hl) {
-        .NORMAL => return escape.color_reset,
-        .NUMBER => return escape.color_red,
+        .NORMAL => return escape.color.reset,
+        .NUMBER => return escape.color.red,
+        .MATCH => return escape.color.blue,
     }
 }
 
@@ -350,11 +355,18 @@ fn editorSave(allocator: std.mem.Allocator) !void {
 
 // Find
 
-fn editorFindCallback(query: []u8, key: u32) void {
+fn editorFindCallback(query: []u8, key: u32) !void {
     const Static = struct {
         var last_match: i32 = -1;
         var direction: i32 = 1;
+        var saved_hl_line: usize = undefined;
+        var saved_hl: std.ArrayList(EditorHighlight) = undefined;
     };
+
+    if (Static.saved_hl.items.len > 0) {
+        std.mem.swap(std.ArrayList(EditorHighlight), &E.rows.items[Static.saved_hl_line].hl, &Static.saved_hl);
+        Static.saved_hl.clearAndFree();
+    }
     if (key == '\r' or key == escape.esc[0]) {
         Static.last_match = -1;
         Static.direction = 1;
@@ -382,6 +394,13 @@ fn editorFindCallback(query: []u8, key: u32) void {
             E.c.y = @intCast(current);
             E.c.x = editorRowRxToCx(row, pos);
             E.row_offset = E.rows.items.len;
+
+            Static.saved_hl_line = @intCast(current);
+            Static.saved_hl = try row.hl.clone();
+            for (pos..pos + query.len) |i| {
+                row.hl.items[i] = .MATCH;
+            }
+
             break;
         }
     }
@@ -443,7 +462,7 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
             var current_color = EditorHighlight.NORMAL;
             for (E.col_offset..(E.col_offset + @min(len, E.win_size.cols))) |i| {
                 if (hl[i] == .NORMAL and current_color != .NORMAL) {
-                    try buf.appendSlice(escape.color_reset);
+                    try buf.appendSlice(escape.color.reset);
                     current_color = .NORMAL;
                 } else {
                     if (hl[i] != current_color) {
@@ -453,7 +472,7 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
                 }
                 try buf.append(E.rows.items[file_row].render.items[i]);
             }
-            try buf.appendSlice(escape.color_reset);
+            try buf.appendSlice(escape.color.reset);
         }
         try buf.appendSlice(escape.clear_line);
         try buf.appendSlice("\r\n");
@@ -499,12 +518,12 @@ fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) !void {
 fn asInt(comptime k: EditorKey) u32 {
     return @intFromEnum(k);
 }
-fn editorPrompt(allocator: std.mem.Allocator, comptime prompt: []const u8, comptime callback: ?fn ([]u8, u32) void) !std.ArrayList(u8) {
+fn editorPrompt(allocator: std.mem.Allocator, comptime prompt: []const u8, comptime callback: ?fn ([]u8, u32) std.mem.Allocator.Error!void) !std.ArrayList(u8) {
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
 
     var c: u32 = undefined;
-    defer if (callback) |func| func(buf.items, c);
+    defer if (callback) |func| func(buf.items, c) catch {};
 
     while (true) {
         try editorSetStatusMessage(prompt, .{buf.items});
@@ -525,7 +544,7 @@ fn editorPrompt(allocator: std.mem.Allocator, comptime prompt: []const u8, compt
         } else if (c < 128 and !std.ascii.isControl(@intCast(c))) {
             try buf.append(@intCast(c));
         }
-        if (callback) |func| func(buf.items, c);
+        if (callback) |func| try func(buf.items, c);
     }
 }
 
