@@ -27,6 +27,8 @@ const escape = struct {
     const normal_text = esc ++ "[m";
     const color = struct {
         const red = esc ++ "[31m";
+        const green = esc ++ "[32m";
+        const yellow = esc ++ "[33m";
         const blue = esc ++ "[34m";
         const magenta = esc ++ "[35m";
         const cyan = esc ++ "[36m";
@@ -43,11 +45,14 @@ const CursorPos = struct { x: usize, y: usize, rx: usize };
 const EditorSyntax = struct {
     filetype: []const u8,
     filematch: []const []const u8,
+    keywords: []const []const u8,
     singleline_comment_start: []const u8,
     flags: u32,
 };
 const EditorHighlight = enum(u8) {
     NORMAL,
+    KEYWORD1,
+    KEYWORD2,
     COMMENT,
     STRING,
     NUMBER,
@@ -125,15 +130,28 @@ var E: EditorConfig = undefined;
 // Constants
 
 const C_HL_extensions = [_][]const u8{ ".c", ".h", ".cpp" };
+const C_HL_keywords = [_][]const u8{
+    "switch", "if",    "while",   "for",    "break", "continue",  "return",  "else",
+    "struct", "union", "typedef", "static", "enum",  "class",     "case",    "const",
+    "int|",   "long|", "double|", "float|", "char|", "unsigned|", "signed|", "void|",
+};
 const ZIG_HL_extensions = [_][]const u8{".zig"};
+const ZIG_HL_keywords = [_][]const u8{
+    "switch", "if",    "while",   "for",  "break", "continue", "return", "else",
+    "struct", "union", "typedef", "enum", "case",  "const",    "i8|",    "i16|",
+    "i32|",   "i64|",  "isize|",  "u8|",  "u16|",  "u32|",     "u64|",   "usize|",
+    "f32|",   "f64|",  "void|",
+};
 const HLDB = [_]EditorSyntax{ .{
     .filetype = "c",
     .filematch = &C_HL_extensions,
+    .keywords = &C_HL_keywords,
     .singleline_comment_start = "//",
     .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
 }, .{
     .filetype = "zig",
     .filematch = &ZIG_HL_extensions,
+    .keywords = &ZIG_HL_keywords,
     .singleline_comment_start = "//",
     .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
 } };
@@ -272,12 +290,14 @@ fn editorUpdateSyntax(row: *Row) !void {
 
     const syntax = E.syntax orelse return;
 
+    const keyowrds = syntax.keywords;
+
     const scs = syntax.singleline_comment_start;
 
     var prev_sep = true;
     var in_string: u8 = 0;
     var i: usize = 0;
-    while (i < row.render.items.len) : (i += 1) {
+    outer: while (i < row.render.items.len) : (i += 1) {
         var prev_hl = if (i > 0) row.hl.items[i - 1] else EditorHighlight.NORMAL;
         const c = row.render.items[i];
         if (scs.len > 0 and in_string == 0) {
@@ -315,14 +335,31 @@ fn editorUpdateSyntax(row: *Row) !void {
                 prev_sep = false;
                 continue;
             }
-            prev_sep = isSeparator(c);
         }
+        if (prev_sep) {
+            for (keyowrds) |kw| {
+                const len = if (kw[kw.len - 1] == '|') kw.len - 1 else kw.len;
+                if (std.mem.startsWith(u8, row.render.items[i..], kw[0..len]) and
+                    (i + len < row.render.items.len and isSeparator(row.render.items[i + len])))
+                {
+                    for (i..i + len) |j| {
+                        row.hl.items[j] = if (kw.len == len) .KEYWORD1 else .KEYWORD2;
+                    }
+                    i += len;
+                    prev_sep = false;
+                    continue :outer;
+                }
+            }
+        }
+        prev_sep = isSeparator(c);
     }
 }
 
 fn editorSyntaxToColor(hl: EditorHighlight) []const u8 {
     switch (hl) {
         .NORMAL => return escape.color.reset,
+        .KEYWORD1 => return escape.color.yellow,
+        .KEYWORD2 => return escape.color.green,
         .COMMENT => return escape.color.cyan,
         .STRING => return escape.color.magenta,
         .NUMBER => return escape.color.red,
