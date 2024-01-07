@@ -42,7 +42,9 @@ const EditorSyntax = struct {
     filetype: []const u8,
     filematch: []const []const u8,
     keywords: []const []const u8,
-    singleline_comment_start: []const u8,
+    singleline_comment_start: ?[]const u8 = null,
+    multiline_comment_start: ?[]const u8 = null,
+    multiline_comment_end: ?[]const u8 = null,
     flags: u32,
 };
 const EditorHighlight = enum(u8) {
@@ -50,18 +52,22 @@ const EditorHighlight = enum(u8) {
     KEYWORD1,
     KEYWORD2,
     COMMENT,
+    ML_COMMENT,
     STRING,
     NUMBER,
     MATCH,
 };
 const Row = struct {
+    idx: usize,
     chars: std.ArrayList(u8),
     render: std.ArrayList(u8),
     hl: std.ArrayList(EditorHighlight),
+    hl_open_comment: bool = false,
 
     const Self = @This();
-    fn init(allocator: std.mem.Allocator) Self {
+    fn init(allocator: std.mem.Allocator, idx: usize) Self {
         return Self{
+            .idx = idx,
             .chars = std.ArrayList(u8).init(allocator),
             .render = std.ArrayList(u8).init(allocator),
             .hl = std.ArrayList(EditorHighlight).init(allocator),
@@ -143,6 +149,8 @@ const HLDB = [_]EditorSyntax{ .{
     .filematch = &C_HL_extensions,
     .keywords = &C_HL_keywords,
     .singleline_comment_start = "//",
+    .multiline_comment_start = "/*",
+    .multiline_comment_end = "*/",
     .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
 }, .{
     .filetype = "zig",
@@ -289,19 +297,43 @@ fn editorUpdateSyntax(row: *Row) !void {
     const keyowrds = syntax.keywords;
 
     const scs = syntax.singleline_comment_start;
+    const mcs = syntax.multiline_comment_start;
+    const mce = syntax.multiline_comment_start;
 
     var prev_sep = true;
     var in_string: u8 = 0;
+    var in_comment = (row.idx > 0 and E.rows.items[row.idx - 1].hl_open_comment);
     var i: usize = 0;
     outer: while (i < row.render.items.len) : (i += 1) {
         var prev_hl = if (i > 0) row.hl.items[i - 1] else EditorHighlight.NORMAL;
         const c = row.render.items[i];
-        if (scs.len > 0 and in_string == 0) {
-            if (std.mem.startsWith(u8, row.render.items[i..], scs)) {
+        if (scs != null and in_string == 0 and !in_comment) {
+            if (std.mem.startsWith(u8, row.render.items[i..], scs.?)) {
                 for (i..row.render.items.len) |j| {
                     row.hl.items[j] = .COMMENT;
                 }
                 break;
+            }
+        }
+        if (mcs != null and mce != null and in_string == 0) {
+            if (in_comment) {
+                row.hl.items[i] = .ML_COMMENT;
+                if (std.mem.startsWith(u8, row.render.items[i..], mce.?)) {
+                    for (i..i + mce.?.len) |j| {
+                        row.hl.items[j] = .ML_COMMENT;
+                    }
+                    i += mce.?.len - 1;
+                    in_comment = false;
+                    prev_sep = true;
+                }
+                continue;
+            } else if (std.mem.startsWith(u8, row.render.items[i..], mcs.?)) {
+                for (i..i + mcs.?.len) |j| {
+                    row.hl.items[j] = .ML_COMMENT;
+                }
+                i += mcs.?.len - 1;
+                in_comment = true;
+                continue;
             }
         }
         if (syntax.flags & HL_HIGHLIGHT_STRINGS != 0) {
@@ -341,7 +373,7 @@ fn editorUpdateSyntax(row: *Row) !void {
                     for (i..i + len) |j| {
                         row.hl.items[j] = if (kw.len == len) .KEYWORD1 else .KEYWORD2;
                     }
-                    i += len;
+                    i += len - 1;
                     prev_sep = false;
                     continue :outer;
                 }
@@ -349,6 +381,10 @@ fn editorUpdateSyntax(row: *Row) !void {
         }
         prev_sep = isSeparator(c);
     }
+    const changed = (row.hl_open_comment != in_comment);
+    row.hl_open_comment = in_comment;
+    if (changed and row.idx + 1 < E.rows.items.len)
+        try editorUpdateSyntax(&E.rows.items[row.idx + 1]);
 }
 
 fn editorSyntaxToColor(hl: EditorHighlight) []const u8 {
@@ -356,7 +392,7 @@ fn editorSyntaxToColor(hl: EditorHighlight) []const u8 {
         .NORMAL => return escape.color.reset,
         .KEYWORD1 => return escape.color.yellow,
         .KEYWORD2 => return escape.color.green,
-        .COMMENT => return escape.color.cyan,
+        .COMMENT, .ML_COMMENT => return escape.color.cyan,
         .STRING => return escape.color.magenta,
         .NUMBER => return escape.color.red,
         .MATCH => return escape.color.blue,
@@ -405,7 +441,7 @@ fn editorUpdateRow(row: *Row) !void {
 
 fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
     if (E.c.y == E.rows.items.len) {
-        try E.rows.append(Row.init(allocator));
+        try E.rows.append(Row.init(allocator, E.c.y));
     }
     try E.rows.items[E.c.y].chars.insert(E.c.x, c);
     try editorUpdateRow(&E.rows.items[E.c.y]);
@@ -415,14 +451,17 @@ fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
 
 fn editorInsertNewline(allocator: std.mem.Allocator) !void {
     if (E.c.x == 0) {
-        try E.rows.insert(E.c.y, Row.init(allocator));
+        try E.rows.insert(E.c.y, Row.init(allocator, E.c.y));
     } else {
-        var row = Row.init(allocator);
+        var row = Row.init(allocator, E.c.y + 1);
         try row.chars.appendSlice(E.rows.items[E.c.y].chars.items[E.c.x..]);
         try E.rows.insert(E.c.y + 1, row);
         try editorUpdateRow(&E.rows.items[E.c.y + 1]);
         try E.rows.items[E.c.y].chars.resize(E.c.x);
         try editorUpdateRow(&E.rows.items[E.c.y]);
+    }
+    for (E.c.y + 1..E.rows.items.len) |i| {
+        E.rows.items[i].idx += i;
     }
     E.c.y += 1;
     E.c.x = 0;
@@ -441,6 +480,9 @@ fn editorDelChar() !void {
         try E.rows.items[E.c.y - 1].chars.appendSlice(E.rows.items[E.c.y].chars.items);
         E.rows.items[E.c.y].deinit();
         _ = E.rows.orderedRemove(E.c.y);
+        for (E.c.y..E.rows.items.len) |i| {
+            E.rows.items[i].idx = i;
+        }
         E.dirty = true;
         E.c.y -= 1;
         try editorUpdateRow(&E.rows.items[E.c.y]);
@@ -457,7 +499,7 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     defer file.close();
     var buf: [1024]u8 = undefined;
     while (try file.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
-        var row = Row.init(allocator);
+        var row = Row.init(allocator, E.rows.items.len);
         try row.chars.appendSlice(line);
         try editorUpdateRow(&row);
         try E.rows.append(row);
@@ -603,16 +645,27 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
             if (len > E.col_offset) len -= E.col_offset else len = 0;
             var current_color = EditorHighlight.NORMAL;
             for (E.col_offset..(E.col_offset + @min(len, E.win_size.cols))) |i| {
+                const c = E.rows.items[file_row].render.items[i];
+                if (std.ascii.isControl(c)) {
+                    const sym = if (c <= 26) '@' + c else '?';
+                    try buf.appendSlice(escape.invert_colors);
+                    try buf.append(sym);
+                    try buf.appendSlice(escape.normal_text);
+                    if (current_color != .NORMAL) {
+                        try buf.appendSlice(editorSyntaxToColor(current_color));
+                    }
+                }
                 if (hl[i] == .NORMAL and current_color != .NORMAL) {
                     try buf.appendSlice(escape.color.reset);
                     current_color = .NORMAL;
+                    try buf.append(c);
                 } else {
                     if (hl[i] != current_color) {
                         try buf.appendSlice(editorSyntaxToColor(hl[i]));
                         current_color = hl[i];
                     }
+                    try buf.append(c);
                 }
-                try buf.append(E.rows.items[file_row].render.items[i]);
             }
             try buf.appendSlice(escape.color.reset);
         }
