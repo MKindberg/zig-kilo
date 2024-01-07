@@ -227,13 +227,26 @@ fn getCursorPosition() !WindowSize {
 
 // Syntax highlighting
 
+fn isSeparator(c: u8) bool {
+    return std.ascii.isWhitespace(c) or std.mem.indexOfScalar(u8, ",.()+-/*=~%<>[];", c) != null;
+}
+
 fn editorUpdateSyntax(row: *Row) !void {
     try row.hl.appendNTimes(EditorHighlight.NORMAL, row.render.items.len);
 
-    for (row.render.items, 0..) |c, i| {
-        if (std.ascii.isDigit(c)) {
+    var prev_sep = true;
+    var i: usize = 0;
+    while (i < row.render.items.len) : (i += 1) {
+        var prev_hl = if (i > 0) row.hl.items[i - 1] else EditorHighlight.NORMAL;
+        const c = row.render.items[i];
+        if (std.ascii.isDigit(c) and (prev_sep or prev_hl == EditorHighlight.NUMBER) or
+            (c == '.' and prev_hl == EditorHighlight.NUMBER))
+        {
             row.hl.items[i] = .NUMBER;
+            prev_sep = false;
+            continue;
         }
+        prev_sep = isSeparator(c);
     }
 }
 
