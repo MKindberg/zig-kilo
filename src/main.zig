@@ -9,6 +9,10 @@ const KILO_VERSION = "0.0.1";
 const KILO_TAB_STOP = 8;
 const KILO_QUIT_TIMES = 3;
 const STDOUT = std.io.getStdOut();
+
+const HL_HIGHLIGHT_NUMBERS = (1 << 0);
+const HL_HIGHLIGHT_STRINGS = (1 << 1);
+
 const escape = struct {
     const esc = "\x1b";
     const clear_screen = esc ++ "[2J";
@@ -24,6 +28,8 @@ const escape = struct {
     const color = struct {
         const red = esc ++ "[31m";
         const blue = esc ++ "[34m";
+        const magenta = esc ++ "[35m";
+        const cyan = esc ++ "[36m";
         const reset = esc ++ "[39m";
     };
 };
@@ -34,8 +40,16 @@ const TermError = error{
 // Structs
 const WindowSize = struct { rows: usize, cols: usize };
 const CursorPos = struct { x: usize, y: usize, rx: usize };
+const EditorSyntax = struct {
+    filetype: []const u8,
+    filematch: []const []const u8,
+    singleline_comment_start: []const u8,
+    flags: u32,
+};
 const EditorHighlight = enum(u8) {
-    NORMAL = 0,
+    NORMAL,
+    COMMENT,
+    STRING,
     NUMBER,
     MATCH,
 };
@@ -68,6 +82,7 @@ const EditorConfig = struct {
     filename: std.ArrayList(u8),
     statusmsg: struct { msg: []u8, buf: [80]u8, time: i64 },
     dirty: bool,
+    syntax: ?EditorSyntax,
 
     const Self = @This();
     fn init(self: *Self, allocator: std.mem.Allocator) !void {
@@ -80,6 +95,7 @@ const EditorConfig = struct {
         self.statusmsg.msg = self.statusmsg.buf[0..0];
         self.statusmsg.time = 0;
         self.dirty = false;
+        self.syntax = null;
 
         self.win_size.rows -= 2;
     }
@@ -103,7 +119,26 @@ const EditorKey = enum(u32) {
 };
 
 // Globals
+
 var E: EditorConfig = undefined;
+
+// Constants
+
+const C_HL_extensions = [_][]const u8{ ".c", ".h", ".cpp" };
+const ZIG_HL_extensions = [_][]const u8{".zig"};
+const HLDB = [_]EditorSyntax{ .{
+    .filetype = "c",
+    .filematch = &C_HL_extensions,
+    .singleline_comment_start = "//",
+    .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
+}, .{
+    .filetype = "zig",
+    .filematch = &ZIG_HL_extensions,
+    .singleline_comment_start = "//",
+    .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
+} };
+
+// Main
 
 fn ctrlKey(c: u8) u8 {
     return c & 0x1f;
@@ -232,29 +267,88 @@ fn isSeparator(c: u8) bool {
 }
 
 fn editorUpdateSyntax(row: *Row) !void {
+    row.hl.clearRetainingCapacity();
     try row.hl.appendNTimes(EditorHighlight.NORMAL, row.render.items.len);
 
+    const syntax = E.syntax orelse return;
+
+    const scs = syntax.singleline_comment_start;
+
     var prev_sep = true;
+    var in_string: u8 = 0;
     var i: usize = 0;
     while (i < row.render.items.len) : (i += 1) {
         var prev_hl = if (i > 0) row.hl.items[i - 1] else EditorHighlight.NORMAL;
         const c = row.render.items[i];
-        if (std.ascii.isDigit(c) and (prev_sep or prev_hl == EditorHighlight.NUMBER) or
-            (c == '.' and prev_hl == EditorHighlight.NUMBER))
-        {
-            row.hl.items[i] = .NUMBER;
-            prev_sep = false;
-            continue;
+        if (scs.len > 0 and in_string == 0) {
+            if (std.mem.startsWith(u8, row.render.items[i..], scs)) {
+                for (i..row.render.items.len) |j| {
+                    row.hl.items[j] = .COMMENT;
+                }
+                break;
+            }
         }
-        prev_sep = isSeparator(c);
+        if (syntax.flags & HL_HIGHLIGHT_STRINGS != 0) {
+            if (in_string != 0) {
+                row.hl.items[i] = .STRING;
+                if (c == '\\' and i + 1 < row.render.items.len) {
+                    row.hl.items[i + 1] = .STRING;
+                    i += 1;
+                    continue;
+                }
+                if (c == in_string) in_string = 0;
+                prev_sep = true;
+                continue;
+            } else {
+                if (c == '"' or c == '\'') {
+                    in_string = c;
+                    row.hl.items[i] = .STRING;
+                    continue;
+                }
+            }
+        }
+        if (syntax.flags & HL_HIGHLIGHT_NUMBERS != 0) {
+            if (std.ascii.isDigit(c) and (prev_sep or prev_hl == EditorHighlight.NUMBER) or
+                (c == '.' and prev_hl == EditorHighlight.NUMBER))
+            {
+                row.hl.items[i] = .NUMBER;
+                prev_sep = false;
+                continue;
+            }
+            prev_sep = isSeparator(c);
+        }
     }
 }
 
 fn editorSyntaxToColor(hl: EditorHighlight) []const u8 {
     switch (hl) {
         .NORMAL => return escape.color.reset,
+        .COMMENT => return escape.color.cyan,
+        .STRING => return escape.color.magenta,
         .NUMBER => return escape.color.red,
         .MATCH => return escape.color.blue,
+    }
+}
+
+fn editorSelectSyntaxHighlight() void {
+    E.syntax = null;
+    if (E.filename.items.len == 0) return;
+
+    const ext = if (std.mem.lastIndexOfScalar(u8, E.filename.items, '.')) |i|
+        E.filename.items[i..]
+    else
+        "";
+
+    for (HLDB) |entry| {
+        for (entry.filematch) |pattern| {
+            const is_ext = pattern[0] == '.';
+            if (is_ext and ext.len > 0 and std.mem.eql(u8, ext, pattern) or
+                !is_ext and std.mem.eql(u8, E.filename.items, pattern))
+            {
+                E.syntax = entry;
+                return;
+            }
+        }
     }
 }
 
@@ -325,6 +419,7 @@ fn editorDelChar() !void {
 fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     E.filename.clearRetainingCapacity();
     try E.filename.appendSlice(filename);
+    editorSelectSyntaxHighlight();
     var file = try std.fs.cwd().openFile(filename, .{});
     defer file.close();
     var buf: [1024]u8 = undefined;
@@ -345,6 +440,7 @@ fn editorSave(allocator: std.mem.Allocator) !void {
             return;
         }
     }
+    editorSelectSyntaxHighlight();
 
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
@@ -500,7 +596,7 @@ fn editorDrawStatusBar(buf: *std.ArrayList(u8)) !void {
     const f = if (E.filename.items.len == 0) "[No Name]" else E.filename.items;
     const dirty = if (E.dirty) "(modified)" else "";
     const len = (try std.fmt.bufPrint(&status, "{s} - {} lines {s}", .{ f[0..@min(20, f.len)], E.rows.items.len, dirty })).len;
-    const rlen = (try std.fmt.bufPrint(&rstatus, "{}/{}", .{ E.c.y + 1, E.rows.items.len })).len;
+    const rlen = (try std.fmt.bufPrint(&rstatus, "{s} | {}/{}", .{ if (E.syntax) |s| s.filetype else "Unknown ft", E.c.y + 1, E.rows.items.len })).len;
 
     try buf.appendSlice(status[0..@min(len, E.win_size.cols)]);
     if (E.win_size.cols > len + rlen) {
