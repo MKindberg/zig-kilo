@@ -36,7 +36,19 @@ const TermError = error{
 };
 
 // Structs
-const WindowSize = struct { rows: usize, cols: usize };
+const WindowSize = struct {
+    rows: usize,
+    cols: usize,
+
+    fn init() !WindowSize {
+        var ws: std.os.linux.winsize = undefined;
+        if (std.os.linux.ioctl(STDOUT.handle, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws)) != 0 or ws.ws_col == 0) {
+            if (try STDOUT.write(escape.cursor_to_bot ++ escape.cursor_to_right) != 12) return TermError.get_win_size_failed;
+            return getCursorPosition();
+        }
+        return WindowSize{ .rows = ws.ws_row, .cols = ws.ws_col };
+    }
+};
 const CursorPos = struct { x: usize, y: usize, rx: usize };
 const EditorSyntax = struct {
     filetype: []const u8,
@@ -78,6 +90,20 @@ const Row = struct {
         self.render.deinit();
         self.hl.deinit();
     }
+
+    fn update(row: *Row) !void {
+        const tabs: usize = std.mem.count(u8, row.chars.items, "\t");
+        try row.render.ensureTotalCapacity(row.chars.items.len + tabs * (KILO_TAB_STOP - 1));
+        row.render.clearRetainingCapacity();
+        for (row.chars.items) |c| {
+            if (c == '\t') {
+                row.render.appendSliceAssumeCapacity(" " ** KILO_TAB_STOP);
+            } else {
+                row.render.appendAssumeCapacity(c);
+            }
+        }
+        try editorUpdateSyntax(row);
+    }
 };
 const EditorConfig = struct {
     orig_termios: std.os.termios,
@@ -94,7 +120,7 @@ const EditorConfig = struct {
     const Self = @This();
     fn init(self: *Self, allocator: std.mem.Allocator) !void {
         self.c = CursorPos{ .x = 0, .y = 0, .rx = 0 };
-        self.win_size = try getWindowSize();
+        self.win_size = try WindowSize.init();
         self.rows = @TypeOf(E.rows).init(allocator);
         self.row_offset = 0;
         self.col_offset = 0;
@@ -251,15 +277,6 @@ fn editorReadKey() !u32 {
         }
     }
     return buf[0];
-}
-
-fn getWindowSize() !WindowSize {
-    var ws: std.os.linux.winsize = undefined;
-    if (std.os.linux.ioctl(STDOUT.handle, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws)) != 0 or ws.ws_col == 0) {
-        if (try STDOUT.write(escape.cursor_to_bot ++ escape.cursor_to_right) != 12) return TermError.get_win_size_failed;
-        return getCursorPosition();
-    }
-    return WindowSize{ .rows = ws.ws_row, .cols = ws.ws_col };
 }
 
 fn getCursorPosition() !WindowSize {
@@ -421,22 +438,6 @@ fn editorSelectSyntaxHighlight() void {
     }
 }
 
-// Row operations
-
-fn editorUpdateRow(row: *Row) !void {
-    const tabs: usize = std.mem.count(u8, row.chars.items, "\t");
-    try row.render.ensureTotalCapacity(row.chars.items.len + tabs * (KILO_TAB_STOP - 1));
-    row.render.clearRetainingCapacity();
-    for (row.chars.items) |c| {
-        if (c == '\t') {
-            row.render.appendSliceAssumeCapacity(" " ** KILO_TAB_STOP);
-        } else {
-            row.render.appendAssumeCapacity(c);
-        }
-    }
-    try editorUpdateSyntax(row);
-}
-
 // Editor operations
 
 fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
@@ -444,7 +445,7 @@ fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
         try E.rows.append(Row.init(allocator, E.c.y));
     }
     try E.rows.items[E.c.y].chars.insert(E.c.x, c);
-    try editorUpdateRow(&E.rows.items[E.c.y]);
+    try E.rows.items[E.c.y].update();
     E.c.x += 1;
     E.dirty = true;
 }
@@ -456,9 +457,9 @@ fn editorInsertNewline(allocator: std.mem.Allocator) !void {
         var row = Row.init(allocator, E.c.y + 1);
         try row.chars.appendSlice(E.rows.items[E.c.y].chars.items[E.c.x..]);
         try E.rows.insert(E.c.y + 1, row);
-        try editorUpdateRow(&E.rows.items[E.c.y + 1]);
+        try E.rows.items[E.c.y + 1].update();
         try E.rows.items[E.c.y].chars.resize(E.c.x);
-        try editorUpdateRow(&E.rows.items[E.c.y]);
+        try E.rows.items[E.c.y].update();
     }
     for (E.c.y + 1..E.rows.items.len) |i| {
         E.rows.items[i].idx += i;
@@ -475,7 +476,7 @@ fn editorDelChar() !void {
         _ = E.rows.items[E.c.y].chars.orderedRemove(E.c.x - 1);
         E.dirty = true;
         E.c.x -= 1;
-        try editorUpdateRow(&E.rows.items[E.c.y]);
+        try E.rows.items[E.c.y].update();
     } else if (E.c.y > 0) {
         try E.rows.items[E.c.y - 1].chars.appendSlice(E.rows.items[E.c.y].chars.items);
         E.rows.items[E.c.y].deinit();
@@ -485,7 +486,7 @@ fn editorDelChar() !void {
         }
         E.dirty = true;
         E.c.y -= 1;
-        try editorUpdateRow(&E.rows.items[E.c.y]);
+        try E.rows.items[E.c.y].update();
     }
 }
 
@@ -501,7 +502,7 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     while (try file.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
         var row = Row.init(allocator, E.rows.items.len);
         try row.chars.appendSlice(line);
-        try editorUpdateRow(&row);
+        try row.update();
         try E.rows.append(row);
     }
 }
