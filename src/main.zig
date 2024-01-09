@@ -43,10 +43,30 @@ const WindowSize = struct {
     fn init() !WindowSize {
         var ws: std.os.linux.winsize = undefined;
         if (std.os.linux.ioctl(STDOUT.handle, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws)) != 0 or ws.ws_col == 0) {
-            if (try STDOUT.write(escape.cursor_to_bot ++ escape.cursor_to_right) != 12) return TermError.get_win_size_failed;
-            return getCursorPosition();
+            return get_window_size_backup();
         }
         return WindowSize{ .rows = ws.ws_row, .cols = ws.ws_col };
+    }
+
+    fn get_window_size_backup() !WindowSize {
+        if (try STDOUT.write(escape.cursor_to_bot ++ escape.cursor_to_right) != 12) return TermError.get_win_size_failed;
+        if (try STDOUT.write(escape.get_cursor_pos) != 4) return TermError.get_win_size_failed;
+        try STDOUT.writer().print("\r\n", .{});
+
+        var i: usize = 0;
+        var buf: [32]u8 = undefined;
+        while (i < buf.len) : (i += 1) {
+            if (try std.io.getStdIn().read(buf[i .. i + 1]) != 1) break;
+            if (buf[i] == 'R') break;
+        }
+
+        if (buf[0] != escape.esc[0] or buf[1] != '[') return TermError.get_win_size_failed;
+        if (std.mem.indexOf(u8, buf[2..i], ";")) |delimiter| {
+            const d = 2 + delimiter;
+            return WindowSize{ .rows = try std.fmt.parseInt(usize, buf[2..d], 10), .cols = try std.fmt.parseInt(usize, buf[(d + 1)..i], 10) };
+        }
+
+        return TermError.get_win_size_failed;
     }
 };
 const CursorPos = struct { x: usize, y: usize, rx: usize };
@@ -68,6 +88,18 @@ const EditorHighlight = enum(u8) {
     STRING,
     NUMBER,
     MATCH,
+
+    fn toColor(self: EditorHighlight) []const u8 {
+        switch (self) {
+            .NORMAL => return escape.color.reset,
+            .KEYWORD1 => return escape.color.yellow,
+            .KEYWORD2 => return escape.color.green,
+            .COMMENT, .ML_COMMENT => return escape.color.cyan,
+            .STRING => return escape.color.magenta,
+            .NUMBER => return escape.color.red,
+            .MATCH => return escape.color.blue,
+        }
+    }
 };
 const Row = struct {
     idx: usize,
@@ -104,7 +136,49 @@ const Row = struct {
         }
         try editorUpdateSyntax(row);
     }
+
+    fn cxToRx(row: Row, cx: usize) usize {
+        var rx: usize = 0;
+        var j: usize = 0;
+        while (j < cx) : (j += 1) {
+            if (row.chars.items[j] == '\t')
+                rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+            rx += 1;
+        }
+        return rx;
+    }
+
+    fn rxToCx(row: Row, rx: usize) usize {
+        var cur_rx: usize = 0;
+        for (row.chars.items, 0..) |c, cx| {
+            if (c == '\t') cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
+            cur_rx += 1;
+            if (cur_rx > rx) return cx;
+        }
+        return row.chars.items.len;
+    }
 };
+
+const StatusMessage = struct {
+    msg: []u8,
+    buf: [80]u8,
+    time: i64,
+
+    const Self = @This();
+    fn set(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        self.msg = try std.fmt.bufPrint(&self.buf, fmt, args);
+        self.time = std.time.milliTimestamp();
+    }
+
+    fn draw(self: Self, buf: *std.ArrayList(u8)) !void {
+        try buf.appendSlice(escape.clear_line);
+        const len = @min(self.msg.len, E.win_size.cols);
+        if (len > 0 and self.time > std.time.milliTimestamp() - 5000) {
+            try buf.appendSlice(self.msg[0..len]);
+        }
+    }
+};
+
 const EditorConfig = struct {
     orig_termios: std.os.termios,
     win_size: WindowSize,
@@ -113,7 +187,7 @@ const EditorConfig = struct {
     row_offset: usize,
     col_offset: usize,
     filename: std.ArrayList(u8),
-    statusmsg: struct { msg: []u8, buf: [80]u8, time: i64 },
+    statusmsg: StatusMessage,
     dirty: bool,
     syntax: ?EditorSyntax,
 
@@ -209,7 +283,7 @@ pub fn main() !void {
         try editorOpen(allocator, filename);
     }
 
-    try editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find", .{});
+    try E.statusmsg.set("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find", .{});
 
     while (true) {
         try editorRefreshScreen(allocator);
@@ -277,26 +351,6 @@ fn editorReadKey() !u32 {
         }
     }
     return buf[0];
-}
-
-fn getCursorPosition() !WindowSize {
-    if (try STDOUT.write(escape.get_cursor_pos) != 4) return TermError.get_win_size_failed;
-    try STDOUT.writer().print("\r\n", .{});
-
-    var i: usize = 0;
-    var buf: [32]u8 = undefined;
-    while (i < buf.len) : (i += 1) {
-        if (try std.io.getStdIn().read(buf[i .. i + 1]) != 1) break;
-        if (buf[i] == 'R') break;
-    }
-
-    if (buf[0] != escape.esc[0] or buf[1] != '[') return TermError.get_win_size_failed;
-    if (std.mem.indexOf(u8, buf[2..i], ";")) |delimiter| {
-        const d = 2 + delimiter;
-        return WindowSize{ .rows = try std.fmt.parseInt(usize, buf[2..d], 10), .cols = try std.fmt.parseInt(usize, buf[(d + 1)..i], 10) };
-    }
-
-    return TermError.get_win_size_failed;
 }
 
 // Syntax highlighting
@@ -404,18 +458,6 @@ fn editorUpdateSyntax(row: *Row) !void {
         try editorUpdateSyntax(&E.rows.items[row.idx + 1]);
 }
 
-fn editorSyntaxToColor(hl: EditorHighlight) []const u8 {
-    switch (hl) {
-        .NORMAL => return escape.color.reset,
-        .KEYWORD1 => return escape.color.yellow,
-        .KEYWORD2 => return escape.color.green,
-        .COMMENT, .ML_COMMENT => return escape.color.cyan,
-        .STRING => return escape.color.magenta,
-        .NUMBER => return escape.color.red,
-        .MATCH => return escape.color.blue,
-    }
-}
-
 fn editorSelectSyntaxHighlight() void {
     E.syntax = null;
     if (E.filename.items.len == 0) return;
@@ -512,7 +554,7 @@ fn editorSave(allocator: std.mem.Allocator) !void {
         E.filename.deinit();
         E.filename = try editorPrompt(allocator, "Save as: {s} (ESC to cancel)", null);
         if (E.filename.items.len == 0) {
-            try editorSetStatusMessage("Save aborted", .{});
+            try E.statusmsg.set("Save aborted", .{});
             return;
         }
     }
@@ -525,17 +567,17 @@ fn editorSave(allocator: std.mem.Allocator) !void {
     }
 
     var file = std.fs.cwd().createFile(E.filename.items, .{ .read = true, .truncate = true, .mode = 0o664 }) catch |e| {
-        try editorSetStatusMessage("Failed to open file: {}", .{e});
+        try E.statusmsg.set("Failed to open file: {}", .{e});
         return;
     };
     defer file.close();
 
     file.writer().print("{s}", .{buf.items}) catch |e| {
-        try editorSetStatusMessage("Failed to write to file: {}", .{e});
+        try E.statusmsg.set("Failed to write to file: {}", .{e});
         return;
     };
     E.dirty = false;
-    try editorSetStatusMessage("{} bytes written to disk", .{buf.items.len});
+    try E.statusmsg.set("{} bytes written to disk", .{buf.items.len});
 }
 
 // Find
@@ -555,7 +597,7 @@ fn editorFindCallback(query: []u8, key: u32) !void {
     if (key == '\r' or key == escape.esc[0]) {
         Static.last_match = -1;
         Static.direction = 1;
-        editorSetStatusMessage("", .{}) catch {};
+        E.statusmsg.set("", .{}) catch {};
         return;
     } else if (key == asInt(.ARROW_RIGHT) or key == asInt(.ARROW_DOWN)) {
         Static.direction = 1;
@@ -577,7 +619,7 @@ fn editorFindCallback(query: []u8, key: u32) !void {
         if (std.mem.indexOf(u8, row.render.items, query)) |pos| {
             Static.last_match = current;
             E.c.y = @intCast(current);
-            E.c.x = editorRowRxToCx(row, pos);
+            E.c.x = row.rxToCx(pos);
             E.row_offset = E.rows.items.len;
 
             Static.saved_hl_line = @intCast(current);
@@ -619,11 +661,12 @@ fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
     try buf.appendSlice(escape.cursor_to_top);
     try editorDrawRows(&buf);
     try editorDrawStatusBar(&buf);
-    try editorDrawMessageBar(&buf);
+    try E.statusmsg.draw(&buf);
     try buf.writer().print(escape.esc ++ "[{};{}H", .{ (E.c.y - E.row_offset) + 1, (E.c.rx - E.col_offset) + 1 });
     try buf.appendSlice(escape.show_cursor);
     _ = try STDOUT.write(buf.items);
 }
+
 fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
     for (0..E.win_size.rows) |y| {
         var file_row = y + E.row_offset;
@@ -653,7 +696,7 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
                     try buf.append(sym);
                     try buf.appendSlice(escape.normal_text);
                     if (current_color != .NORMAL) {
-                        try buf.appendSlice(editorSyntaxToColor(current_color));
+                        try buf.appendSlice(current_color.toColor());
                     }
                 }
                 if (hl[i] == .NORMAL and current_color != .NORMAL) {
@@ -662,7 +705,7 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
                     try buf.append(c);
                 } else {
                     if (hl[i] != current_color) {
-                        try buf.appendSlice(editorSyntaxToColor(hl[i]));
+                        try buf.appendSlice(hl[i].toColor());
                         current_color = hl[i];
                     }
                     try buf.append(c);
@@ -697,19 +740,6 @@ fn editorDrawStatusBar(buf: *std.ArrayList(u8)) !void {
     try buf.appendSlice("\r\n");
 }
 
-fn editorDrawMessageBar(buf: *std.ArrayList(u8)) !void {
-    try buf.appendSlice(escape.clear_line);
-    const len = @min(E.statusmsg.msg.len, E.win_size.cols);
-    if (len > 0 and E.statusmsg.time > std.time.milliTimestamp() - 5000) {
-        try buf.appendSlice(E.statusmsg.msg[0..len]);
-    }
-}
-
-fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) !void {
-    E.statusmsg.msg = try std.fmt.bufPrint(&E.statusmsg.buf, fmt, args);
-    E.statusmsg.time = std.time.milliTimestamp();
-}
-
 // Input
 fn asInt(comptime k: EditorKey) u32 {
     return @intFromEnum(k);
@@ -722,7 +752,7 @@ fn editorPrompt(allocator: std.mem.Allocator, comptime prompt: []const u8, compt
     defer if (callback) |func| func(buf.items, c) catch {};
 
     while (true) {
-        try editorSetStatusMessage(prompt, .{buf.items});
+        try E.statusmsg.set(prompt, .{buf.items});
         try editorRefreshScreen(allocator);
 
         c = try editorReadKey();
@@ -734,7 +764,7 @@ fn editorPrompt(allocator: std.mem.Allocator, comptime prompt: []const u8, compt
             return buf;
         } else if (c == '\r') {
             if (buf.items.len != 0) {
-                try editorSetStatusMessage("", .{});
+                try E.statusmsg.set("", .{});
                 return buf;
             }
         } else if (c < 128 and !std.ascii.isControl(@intCast(c))) {
@@ -757,7 +787,7 @@ fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
         ctrlKey('q') => {
             if (E.dirty) {
                 if (Static.quit_times > 0) {
-                    try editorSetStatusMessage("WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.", .{Static.quit_times});
+                    try E.statusmsg.set("WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.", .{Static.quit_times});
                     Static.quit_times -= 1;
                     return true;
                 }
@@ -797,31 +827,10 @@ fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
     return true;
 }
 
-fn editorRowCxToRx(row: *Row, cx: usize) usize {
-    var rx: usize = 0;
-    var j: usize = 0;
-    while (j < cx) : (j += 1) {
-        if (row.chars.items[j] == '\t')
-            rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
-        rx += 1;
-    }
-    return rx;
-}
-
-fn editorRowRxToCx(row: Row, rx: usize) usize {
-    var cur_rx: usize = 0;
-    for (row.chars.items, 0..) |c, cx| {
-        if (c == '\t') cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
-        cur_rx += 1;
-        if (cur_rx > rx) return cx;
-    }
-    return row.chars.items.len;
-}
-
 fn editorScroll() void {
     E.c.rx = 0;
     if (E.c.y < E.rows.items.len) {
-        E.c.rx = editorRowCxToRx(&E.rows.items[E.c.y], E.c.x);
+        E.c.rx = E.rows.items[E.c.y].cxToRx(E.c.x);
     }
     if (E.c.y < E.row_offset) {
         E.row_offset = E.c.y;
