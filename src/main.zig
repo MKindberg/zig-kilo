@@ -231,31 +231,27 @@ var E: EditorConfig = undefined;
 
 // Constants
 
-const C_HL_extensions = [_][]const u8{ ".c", ".h", ".cpp" };
-const C_HL_keywords = [_][]const u8{
-    "switch", "if",    "while",   "for",    "break", "continue",  "return",  "else",
-    "struct", "union", "typedef", "static", "enum",  "class",     "case",    "const",
-    "int|",   "long|", "double|", "float|", "char|", "unsigned|", "signed|", "void|",
-};
-const ZIG_HL_extensions = [_][]const u8{".zig"};
-const ZIG_HL_keywords = [_][]const u8{
-    "switch", "if",    "while",   "for",  "break", "continue", "return", "else",
-    "struct", "union", "typedef", "enum", "case",  "const",    "i8|",    "i16|",
-    "i32|",   "i64|",  "isize|",  "u8|",  "u16|",  "u32|",     "u64|",   "usize|",
-    "f32|",   "f64|",  "void|",
-};
 const HLDB = [_]EditorSyntax{ .{
     .filetype = "c",
-    .filematch = &C_HL_extensions,
-    .keywords = &C_HL_keywords,
+    .filematch = &[_][]const u8{ ".c", ".h", ".cpp" },
+    .keywords = &[_][]const u8{
+        "switch", "if",    "while",   "for",    "break", "continue",  "return",  "else",
+        "struct", "union", "typedef", "static", "enum",  "class",     "case",    "const",
+        "int|",   "long|", "double|", "float|", "char|", "unsigned|", "signed|", "void|",
+    },
     .singleline_comment_start = "//",
     .multiline_comment_start = "/*",
     .multiline_comment_end = "*/",
     .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
 }, .{
     .filetype = "zig",
-    .filematch = &ZIG_HL_extensions,
-    .keywords = &ZIG_HL_keywords,
+    .filematch = &[_][]const u8{".zig"},
+    .keywords = &[_][]const u8{
+        "switch", "if",    "while",   "for",  "break", "continue", "return", "else",
+        "struct", "union", "typedef", "enum", "case",  "const",    "i8|",    "i16|",
+        "i32|",   "i64|",  "isize|",  "u8|",  "u16|",  "u32|",     "u64|",   "usize|",
+        "f32|",   "f64|",  "void|",
+    },
     .singleline_comment_start = "//",
     .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
 } };
@@ -306,7 +302,7 @@ fn enableRawMode() !void {
 
     try std.os.tcsetattr(std.io.getStdIn().handle, std.os.linux.TCSA.FLUSH, raw);
 }
-fn disableRawMode() callconv(.C) void {
+fn disableRawMode() void {
     std.os.tcsetattr(std.io.getStdIn().handle, std.os.linux.TCSA.FLUSH, E.orig_termios) catch std.debug.print("Could not reset terminal\r\n", .{});
 }
 
