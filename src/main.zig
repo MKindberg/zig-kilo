@@ -6,9 +6,6 @@ const KILO_TAB_STOP = 8;
 const KILO_QUIT_TIMES = 3;
 const STDOUT = std.io.getStdOut();
 
-const HL_HIGHLIGHT_NUMBERS = (1 << 0);
-const HL_HIGHLIGHT_STRINGS = (1 << 1);
-
 const escape = struct {
     const esc = "\x1b";
     const clear_screen = esc ++ "[2J";
@@ -71,13 +68,168 @@ const WindowSize = struct {
 };
 const CursorPos = struct { x: usize, y: usize, rx: usize };
 const EditorSyntax = struct {
-    filetype: []const u8,
-    filematch: []const []const u8,
-    keywords: []const []const u8,
+    filetype: []const u8 = "Unknown ft",
+    filematch: []const []const u8 = &[_][]const u8{},
+    keywords: []const []const u8 = &[_][]const u8{},
     singleline_comment_start: ?[]const u8 = null,
     multiline_comment_start: ?[]const u8 = null,
     multiline_comment_end: ?[]const u8 = null,
-    flags: u32,
+    flags: u32 = 0,
+
+    const Self = @This();
+
+    const HIGHLIGHT_NUMBERS = (1 << 0);
+    const HIGHLIGHT_STRINGS = (1 << 1);
+
+    const HLDB = [_]Self{
+        .{
+            .filetype = "c",
+            .filematch = &[_][]const u8{ ".c", ".h", ".cpp" },
+            .keywords = &[_][]const u8{
+                "switch", "if",    "while",   "for",    "break", "continue",  "return",  "else",
+                "struct", "union", "typedef", "static", "enum",  "class",     "case",    "const",
+                "int|",   "long|", "double|", "float|", "char|", "unsigned|", "signed|", "void|",
+            },
+            .singleline_comment_start = "//",
+            .multiline_comment_start = "/*",
+            .multiline_comment_end = "*/",
+            .flags = HIGHLIGHT_NUMBERS | HIGHLIGHT_STRINGS,
+        },
+        .{
+            .filetype = "zig",
+            .filematch = &[_][]const u8{".zig"},
+            .keywords = &[_][]const u8{
+                "switch", "if",    "while",   "for",  "break", "continue", "return", "else",
+                "struct", "union", "typedef", "enum", "case",  "const",    "i8|",    "i16|",
+                "i32|",   "i64|",  "isize|",  "u8|",  "u16|",  "u32|",     "u64|",   "usize|",
+                "f32|",   "f64|",  "void|",
+            },
+            .singleline_comment_start = "//",
+            .flags = HIGHLIGHT_NUMBERS | HIGHLIGHT_STRINGS,
+        },
+    };
+
+    fn init(filename: []const u8) Self {
+        if (filename.len == 0) return EditorSyntax{};
+
+        const ext = if (std.mem.lastIndexOfScalar(u8, filename, '.')) |i|
+            filename[i..]
+        else
+            "";
+
+        for (HLDB) |entry| {
+            for (entry.filematch) |pattern| {
+                const is_ext = pattern[0] == '.';
+                if (is_ext and ext.len > 0 and std.mem.eql(u8, ext, pattern) or
+                    !is_ext and std.mem.eql(u8, filename, pattern))
+                {
+                    return entry;
+                }
+            }
+        }
+        return EditorSyntax{};
+    }
+
+    fn isSeparator(c: u8) bool {
+        return std.ascii.isWhitespace(c) or std.mem.indexOfScalar(u8, ",.()+-/*=~%<>[];", c) != null;
+    }
+
+    fn update(self: Self, row: *Row) !void {
+        row.hl.clearRetainingCapacity();
+        try row.hl.appendNTimes(EditorHighlight.NORMAL, row.render.items.len);
+
+        const keyowrds = self.keywords;
+
+        const scs = self.singleline_comment_start;
+        const mcs = self.multiline_comment_start;
+        const mce = self.multiline_comment_start;
+
+        var prev_sep = true;
+        var in_string: u8 = 0;
+        var in_comment = (row.idx > 0 and E.rows.items[row.idx - 1].hl_open_comment);
+        var i: usize = 0;
+        outer: while (i < row.render.items.len) : (i += 1) {
+            var prev_hl = if (i > 0) row.hl.items[i - 1] else EditorHighlight.NORMAL;
+            const c = row.render.items[i];
+            if (scs != null and in_string == 0 and !in_comment) {
+                if (std.mem.startsWith(u8, row.render.items[i..], scs.?)) {
+                    for (i..row.render.items.len) |j| {
+                        row.hl.items[j] = .COMMENT;
+                    }
+                    break;
+                }
+            }
+            if (mcs != null and mce != null and in_string == 0) {
+                if (in_comment) {
+                    row.hl.items[i] = .ML_COMMENT;
+                    if (std.mem.startsWith(u8, row.render.items[i..], mce.?)) {
+                        for (i..i + mce.?.len) |j| {
+                            row.hl.items[j] = .ML_COMMENT;
+                        }
+                        i += mce.?.len - 1;
+                        in_comment = false;
+                        prev_sep = true;
+                    }
+                    continue;
+                } else if (std.mem.startsWith(u8, row.render.items[i..], mcs.?)) {
+                    for (i..i + mcs.?.len) |j| {
+                        row.hl.items[j] = .ML_COMMENT;
+                    }
+                    i += mcs.?.len - 1;
+                    in_comment = true;
+                    continue;
+                }
+            }
+            if (self.flags & HIGHLIGHT_STRINGS != 0) {
+                if (in_string != 0) {
+                    row.hl.items[i] = .STRING;
+                    if (c == '\\' and i + 1 < row.render.items.len) {
+                        row.hl.items[i + 1] = .STRING;
+                        i += 1;
+                        continue;
+                    }
+                    if (c == in_string) in_string = 0;
+                    prev_sep = true;
+                    continue;
+                } else {
+                    if (c == '"' or c == '\'') {
+                        in_string = c;
+                        row.hl.items[i] = .STRING;
+                        continue;
+                    }
+                }
+            }
+            if (self.flags & HIGHLIGHT_NUMBERS != 0) {
+                if (std.ascii.isDigit(c) and (prev_sep or prev_hl == EditorHighlight.NUMBER) or
+                    (c == '.' and prev_hl == EditorHighlight.NUMBER))
+                {
+                    row.hl.items[i] = .NUMBER;
+                    prev_sep = false;
+                    continue;
+                }
+            }
+            if (prev_sep) {
+                for (keyowrds) |kw| {
+                    const len = if (kw[kw.len - 1] == '|') kw.len - 1 else kw.len;
+                    if (std.mem.startsWith(u8, row.render.items[i..], kw[0..len]) and
+                        (i + len < row.render.items.len and isSeparator(row.render.items[i + len])))
+                    {
+                        for (i..i + len) |j| {
+                            row.hl.items[j] = if (kw.len == len) .KEYWORD1 else .KEYWORD2;
+                        }
+                        i += len - 1;
+                        prev_sep = false;
+                        continue :outer;
+                    }
+                }
+            }
+            prev_sep = isSeparator(c);
+        }
+        const changed = (row.hl_open_comment != in_comment);
+        row.hl_open_comment = in_comment;
+        if (changed and row.idx + 1 < E.rows.items.len)
+            try E.syntax.update(&E.rows.items[row.idx + 1]);
+    }
 };
 const EditorHighlight = enum(u8) {
     NORMAL,
@@ -123,7 +275,7 @@ const Row = struct {
         self.hl.deinit();
     }
 
-    fn update(row: *Row) !void {
+    fn update(row: *Row, syntax: EditorSyntax) !void {
         const tabs: usize = std.mem.count(u8, row.chars.items, "\t");
         try row.render.ensureTotalCapacity(row.chars.items.len + tabs * (KILO_TAB_STOP - 1));
         row.render.clearRetainingCapacity();
@@ -134,7 +286,7 @@ const Row = struct {
                 row.render.appendAssumeCapacity(c);
             }
         }
-        try editorUpdateSyntax(row);
+        try syntax.update(row);
     }
 
     fn cxToRx(row: Row, cx: usize) usize {
@@ -189,7 +341,7 @@ const EditorConfig = struct {
     filename: std.ArrayList(u8),
     statusmsg: StatusMessage,
     dirty: bool,
-    syntax: ?EditorSyntax,
+    syntax: EditorSyntax,
 
     const Self = @This();
     fn init(self: *Self, allocator: std.mem.Allocator) !void {
@@ -202,7 +354,6 @@ const EditorConfig = struct {
         self.statusmsg.msg = self.statusmsg.buf[0..0];
         self.statusmsg.time = 0;
         self.dirty = false;
-        self.syntax = null;
 
         self.win_size.rows -= 2;
     }
@@ -230,31 +381,6 @@ const EditorKey = enum(u32) {
 var E: EditorConfig = undefined;
 
 // Constants
-
-const HLDB = [_]EditorSyntax{ .{
-    .filetype = "c",
-    .filematch = &[_][]const u8{ ".c", ".h", ".cpp" },
-    .keywords = &[_][]const u8{
-        "switch", "if",    "while",   "for",    "break", "continue",  "return",  "else",
-        "struct", "union", "typedef", "static", "enum",  "class",     "case",    "const",
-        "int|",   "long|", "double|", "float|", "char|", "unsigned|", "signed|", "void|",
-    },
-    .singleline_comment_start = "//",
-    .multiline_comment_start = "/*",
-    .multiline_comment_end = "*/",
-    .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
-}, .{
-    .filetype = "zig",
-    .filematch = &[_][]const u8{".zig"},
-    .keywords = &[_][]const u8{
-        "switch", "if",    "while",   "for",  "break", "continue", "return", "else",
-        "struct", "union", "typedef", "enum", "case",  "const",    "i8|",    "i16|",
-        "i32|",   "i64|",  "isize|",  "u8|",  "u16|",  "u32|",     "u64|",   "usize|",
-        "f32|",   "f64|",  "void|",
-    },
-    .singleline_comment_start = "//",
-    .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
-} };
 
 // Main
 
@@ -349,133 +475,6 @@ fn editorReadKey() !u32 {
     return buf[0];
 }
 
-// Syntax highlighting
-
-fn isSeparator(c: u8) bool {
-    return std.ascii.isWhitespace(c) or std.mem.indexOfScalar(u8, ",.()+-/*=~%<>[];", c) != null;
-}
-
-fn editorUpdateSyntax(row: *Row) !void {
-    row.hl.clearRetainingCapacity();
-    try row.hl.appendNTimes(EditorHighlight.NORMAL, row.render.items.len);
-
-    const syntax = E.syntax orelse return;
-
-    const keyowrds = syntax.keywords;
-
-    const scs = syntax.singleline_comment_start;
-    const mcs = syntax.multiline_comment_start;
-    const mce = syntax.multiline_comment_start;
-
-    var prev_sep = true;
-    var in_string: u8 = 0;
-    var in_comment = (row.idx > 0 and E.rows.items[row.idx - 1].hl_open_comment);
-    var i: usize = 0;
-    outer: while (i < row.render.items.len) : (i += 1) {
-        var prev_hl = if (i > 0) row.hl.items[i - 1] else EditorHighlight.NORMAL;
-        const c = row.render.items[i];
-        if (scs != null and in_string == 0 and !in_comment) {
-            if (std.mem.startsWith(u8, row.render.items[i..], scs.?)) {
-                for (i..row.render.items.len) |j| {
-                    row.hl.items[j] = .COMMENT;
-                }
-                break;
-            }
-        }
-        if (mcs != null and mce != null and in_string == 0) {
-            if (in_comment) {
-                row.hl.items[i] = .ML_COMMENT;
-                if (std.mem.startsWith(u8, row.render.items[i..], mce.?)) {
-                    for (i..i + mce.?.len) |j| {
-                        row.hl.items[j] = .ML_COMMENT;
-                    }
-                    i += mce.?.len - 1;
-                    in_comment = false;
-                    prev_sep = true;
-                }
-                continue;
-            } else if (std.mem.startsWith(u8, row.render.items[i..], mcs.?)) {
-                for (i..i + mcs.?.len) |j| {
-                    row.hl.items[j] = .ML_COMMENT;
-                }
-                i += mcs.?.len - 1;
-                in_comment = true;
-                continue;
-            }
-        }
-        if (syntax.flags & HL_HIGHLIGHT_STRINGS != 0) {
-            if (in_string != 0) {
-                row.hl.items[i] = .STRING;
-                if (c == '\\' and i + 1 < row.render.items.len) {
-                    row.hl.items[i + 1] = .STRING;
-                    i += 1;
-                    continue;
-                }
-                if (c == in_string) in_string = 0;
-                prev_sep = true;
-                continue;
-            } else {
-                if (c == '"' or c == '\'') {
-                    in_string = c;
-                    row.hl.items[i] = .STRING;
-                    continue;
-                }
-            }
-        }
-        if (syntax.flags & HL_HIGHLIGHT_NUMBERS != 0) {
-            if (std.ascii.isDigit(c) and (prev_sep or prev_hl == EditorHighlight.NUMBER) or
-                (c == '.' and prev_hl == EditorHighlight.NUMBER))
-            {
-                row.hl.items[i] = .NUMBER;
-                prev_sep = false;
-                continue;
-            }
-        }
-        if (prev_sep) {
-            for (keyowrds) |kw| {
-                const len = if (kw[kw.len - 1] == '|') kw.len - 1 else kw.len;
-                if (std.mem.startsWith(u8, row.render.items[i..], kw[0..len]) and
-                    (i + len < row.render.items.len and isSeparator(row.render.items[i + len])))
-                {
-                    for (i..i + len) |j| {
-                        row.hl.items[j] = if (kw.len == len) .KEYWORD1 else .KEYWORD2;
-                    }
-                    i += len - 1;
-                    prev_sep = false;
-                    continue :outer;
-                }
-            }
-        }
-        prev_sep = isSeparator(c);
-    }
-    const changed = (row.hl_open_comment != in_comment);
-    row.hl_open_comment = in_comment;
-    if (changed and row.idx + 1 < E.rows.items.len)
-        try editorUpdateSyntax(&E.rows.items[row.idx + 1]);
-}
-
-fn editorSelectSyntaxHighlight() void {
-    E.syntax = null;
-    if (E.filename.items.len == 0) return;
-
-    const ext = if (std.mem.lastIndexOfScalar(u8, E.filename.items, '.')) |i|
-        E.filename.items[i..]
-    else
-        "";
-
-    for (HLDB) |entry| {
-        for (entry.filematch) |pattern| {
-            const is_ext = pattern[0] == '.';
-            if (is_ext and ext.len > 0 and std.mem.eql(u8, ext, pattern) or
-                !is_ext and std.mem.eql(u8, E.filename.items, pattern))
-            {
-                E.syntax = entry;
-                return;
-            }
-        }
-    }
-}
-
 // Editor operations
 
 fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
@@ -483,7 +482,7 @@ fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
         try E.rows.append(Row.init(allocator, E.c.y));
     }
     try E.rows.items[E.c.y].chars.insert(E.c.x, c);
-    try E.rows.items[E.c.y].update();
+    try E.rows.items[E.c.y].update(E.syntax);
     E.c.x += 1;
     E.dirty = true;
 }
@@ -495,9 +494,9 @@ fn editorInsertNewline(allocator: std.mem.Allocator) !void {
         var row = Row.init(allocator, E.c.y + 1);
         try row.chars.appendSlice(E.rows.items[E.c.y].chars.items[E.c.x..]);
         try E.rows.insert(E.c.y + 1, row);
-        try E.rows.items[E.c.y + 1].update();
+        try E.rows.items[E.c.y + 1].update(E.syntax);
         try E.rows.items[E.c.y].chars.resize(E.c.x);
-        try E.rows.items[E.c.y].update();
+        try E.rows.items[E.c.y].update(E.syntax);
     }
     for (E.c.y + 1..E.rows.items.len) |i| {
         E.rows.items[i].idx += i;
@@ -514,7 +513,7 @@ fn editorDelChar() !void {
         _ = E.rows.items[E.c.y].chars.orderedRemove(E.c.x - 1);
         E.dirty = true;
         E.c.x -= 1;
-        try E.rows.items[E.c.y].update();
+        try E.rows.items[E.c.y].update(E.syntax);
     } else if (E.c.y > 0) {
         try E.rows.items[E.c.y - 1].chars.appendSlice(E.rows.items[E.c.y].chars.items);
         E.rows.items[E.c.y].deinit();
@@ -524,7 +523,7 @@ fn editorDelChar() !void {
         }
         E.dirty = true;
         E.c.y -= 1;
-        try E.rows.items[E.c.y].update();
+        try E.rows.items[E.c.y].update(E.syntax);
     }
 }
 
@@ -533,14 +532,14 @@ fn editorDelChar() !void {
 fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     E.filename.clearRetainingCapacity();
     try E.filename.appendSlice(filename);
-    editorSelectSyntaxHighlight();
+    E.syntax = EditorSyntax.init(filename);
     var file = try std.fs.cwd().openFile(filename, .{});
     defer file.close();
     var buf: [1024]u8 = undefined;
     while (try file.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
         var row = Row.init(allocator, E.rows.items.len);
         try row.chars.appendSlice(line);
-        try row.update();
+        try row.update(E.syntax);
         try E.rows.append(row);
     }
 }
@@ -554,7 +553,7 @@ fn editorSave(allocator: std.mem.Allocator) !void {
             return;
         }
     }
-    editorSelectSyntaxHighlight();
+    E.syntax = EditorSyntax.init(E.filename.items);
 
     var buf = std.ArrayList(u8).init(allocator);
     defer buf.deinit();
@@ -722,7 +721,7 @@ fn editorDrawStatusBar(buf: *std.ArrayList(u8)) !void {
     const f = if (E.filename.items.len == 0) "[No Name]" else E.filename.items;
     const dirty = if (E.dirty) "(modified)" else "";
     const len = (try std.fmt.bufPrint(&status, "{s} - {} lines {s}", .{ f[0..@min(20, f.len)], E.rows.items.len, dirty })).len;
-    const rlen = (try std.fmt.bufPrint(&rstatus, "{s} | {}/{}", .{ if (E.syntax) |s| s.filetype else "Unknown ft", E.c.y + 1, E.rows.items.len })).len;
+    const rlen = (try std.fmt.bufPrint(&rstatus, "{s} | {}/{}", .{ E.syntax.filetype, E.c.y + 1, E.rows.items.len })).len;
 
     try buf.appendSlice(status[0..@min(len, E.win_size.cols)]);
     if (E.win_size.cols > len + rlen) {
