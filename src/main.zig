@@ -5,6 +5,7 @@ const KILO_VERSION = "0.0.1";
 const KILO_TAB_STOP = 8;
 const KILO_QUIT_TIMES = 3;
 const STDOUT = std.io.getStdOut();
+const LINE_NUM_WIDTH = 7;
 
 const escape = struct {
     const esc = "\x1b";
@@ -42,7 +43,7 @@ const WindowSize = struct {
         if (std.os.linux.ioctl(STDOUT.handle, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws)) != 0 or ws.ws_col == 0) {
             return get_window_size_backup();
         }
-        return WindowSize{ .rows = ws.ws_row, .cols = ws.ws_col };
+        return WindowSize{ .rows = ws.ws_row, .cols = ws.ws_col - LINE_NUM_WIDTH };
     }
 
     fn get_window_size_backup() !WindowSize {
@@ -60,7 +61,7 @@ const WindowSize = struct {
         if (buf[0] != escape.esc[0] or buf[1] != '[') return TermError.get_win_size_failed;
         if (std.mem.indexOf(u8, buf[2..i], ";")) |delimiter| {
             const d = 2 + delimiter;
-            return WindowSize{ .rows = try std.fmt.parseInt(usize, buf[2..d], 10), .cols = try std.fmt.parseInt(usize, buf[(d + 1)..i], 10) };
+            return WindowSize{ .rows = try std.fmt.parseInt(usize, buf[2..d], 10), .cols = try std.fmt.parseInt(usize, buf[(d + 1)..i], 10) - LINE_NUM_WIDTH };
         }
 
         return TermError.get_win_size_failed;
@@ -657,7 +658,7 @@ fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
     try editorDrawRows(&buf);
     try editorDrawStatusBar(&buf);
     try E.statusmsg.draw(&buf);
-    try buf.writer().print(escape.esc ++ "[{};{}H", .{ (E.c.y - E.row_offset) + 1, (E.c.rx - E.col_offset) + 1 });
+    try buf.writer().print(escape.esc ++ "[{};{}H", .{ (E.c.y - E.row_offset) + 1, (7 + E.c.rx - E.col_offset) + 1 });
     try buf.appendSlice(escape.show_cursor);
     _ = try STDOUT.write(buf.items);
 }
@@ -679,12 +680,14 @@ fn editorDrawRows(buf: *std.ArrayList(u8)) !void {
                 try buf.append('~');
             }
         } else {
-            const hl = E.rows.items[file_row].hl.items;
-            var len = E.rows.items[file_row].render.items.len;
+            const row = E.rows.items[file_row];
+            const hl = row.hl.items;
+            var len = row.render.items.len;
             if (len > E.col_offset) len -= E.col_offset else len = 0;
             var current_color = EditorHighlight.NORMAL;
+            try buf.writer().print("{: <4} | ", .{row.idx});
             for (E.col_offset..(E.col_offset + @min(len, E.win_size.cols))) |i| {
-                const c = E.rows.items[file_row].render.items[i];
+                const c = row.render.items[i];
                 if (std.ascii.isControl(c)) {
                     const sym = if (c <= 26) '@' + c else '?';
                     try buf.appendSlice(escape.invert_colors);
