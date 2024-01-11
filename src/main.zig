@@ -403,7 +403,7 @@ pub fn main() !void {
     var args = std.process.args();
     _ = args.skip();
     if (args.next()) |filename| {
-        try editorOpen(allocator, filename);
+        try editorOpen(filename);
     }
 
     try E.statusmsg.set("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find", .{});
@@ -478,9 +478,9 @@ fn editorReadKey() !u32 {
 
 // Editor operations
 
-fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
+fn editorInsertChar(c: u8) !void {
     if (E.c.y == E.rows.items.len) {
-        try E.rows.append(Row.init(allocator, E.c.y));
+        try E.rows.append(Row.init(E.rows.allocator, E.c.y));
     }
     try E.rows.items[E.c.y].chars.insert(E.c.x, c);
     try E.rows.items[E.c.y].update(E.syntax);
@@ -488,11 +488,11 @@ fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
     E.dirty = true;
 }
 
-fn editorInsertNewline(allocator: std.mem.Allocator) !void {
+fn editorInsertNewline() !void {
     if (E.c.x == 0) {
-        try E.rows.insert(E.c.y, Row.init(allocator, E.c.y));
+        try E.rows.insert(E.c.y, Row.init(E.rows.allocator, E.c.y));
     } else {
-        var row = Row.init(allocator, E.c.y + 1);
+        var row = Row.init(E.rows.allocator, E.c.y + 1);
         try row.chars.appendSlice(E.rows.items[E.c.y].chars.items[E.c.x..]);
         try E.rows.insert(E.c.y + 1, row);
         try E.rows.items[E.c.y + 1].update(E.syntax);
@@ -530,7 +530,7 @@ fn editorDelChar() !void {
 
 // File IO
 
-fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
+fn editorOpen(filename: []const u8) !void {
     E.filename.clearRetainingCapacity();
     try E.filename.appendSlice(filename);
     E.syntax = EditorSyntax.init(filename);
@@ -538,7 +538,7 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     defer file.close();
     var buf: [1024]u8 = undefined;
     while (try file.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
-        var row = Row.init(allocator, E.rows.items.len);
+        var row = Row.init(E.rows.allocator, E.rows.items.len);
         try row.chars.appendSlice(line);
         try row.update(E.syntax);
         try E.rows.append(row);
@@ -780,7 +780,7 @@ fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
 
     switch (c) {
         '\r' => {
-            try editorInsertNewline(allocator);
+            try editorInsertNewline();
         },
         ctrlKey('q') => {
             if (E.dirty) {
@@ -818,7 +818,7 @@ fn editorProcessKeyPress(allocator: std.mem.Allocator) !bool {
         asInt(.HOME_KEY) => E.c.x = 0,
         asInt(.END_KEY) => E.c.x = if (E.c.y < E.rows.items.len) E.rows.items[E.c.y].chars.items.len else 0,
         else => {
-            try editorInsertChar(allocator, @intCast(c));
+            try editorInsertChar(@intCast(c));
         },
     }
     Static.quit_times = KILO_QUIT_TIMES;
