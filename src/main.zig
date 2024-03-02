@@ -1,4 +1,5 @@
 const std = @import("std");
+const Regex = @import("regex.zig").Regex;
 
 // Constants
 const KILO_VERSION = "0.0.1";
@@ -612,15 +613,15 @@ fn editorFindCallback(query: []u8, key: u32) !void {
         if (current == -1) current = @intCast(E.rows.items.len - 1) else if (current == E.rows.items.len) current = 0;
 
         var row = E.rows.items[@as(usize, @intCast(current))];
-        if (std.mem.indexOf(u8, row.render.items, query)) |pos| {
+        if (Regex.indexOf(row.render.items, query)) |match| {
             Static.last_match = current;
             E.c.y = @intCast(current);
-            E.c.x = row.rxToCx(pos);
+            E.c.x = row.rxToCx(match.start);
             E.row_offset = E.rows.items.len;
 
             Static.saved_hl_line = @intCast(current);
             Static.saved_hl = try row.hl.clone();
-            for (pos..pos + query.len) |i| {
+            for (match.start..match.start + match.len) |i| {
                 row.hl.items[i] = .MATCH;
             }
 
