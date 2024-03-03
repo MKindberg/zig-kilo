@@ -7,6 +7,14 @@ pub const Match = struct {
 
 pub const Regex = struct {
     pub fn indexOf(haystack: []const u8, needle: []const u8) ?Match {
+        if (needle.len > 1 and needle[0] == '^') {
+            const m = matches(haystack, needle[1..]);
+            const match = m[0];
+            const len = m[1];
+            if (match) {
+                return Match{ .start = 0, .len = len };
+            }
+        }
         for (0..haystack.len) |i| {
             const m = matches(haystack[i..], needle);
             const match = m[0];
@@ -43,11 +51,24 @@ pub const Regex = struct {
                         'O' => if (!(string[j] >= '0' and string[j] <= '7')) return .{ false, 0 },
                         '\\' => if (string[j] != '\\') return .{ false, 0 },
                         '.' => if (string[j] != '.') return .{ false, 0 },
+                        '^' => if (string[j] != '^') return .{ false, 0 },
+                        '$' => if (string[j] != '$') return .{ false, 0 },
                         else => return .{ false, 0 },
+                    }
+                },
+                '$' => {
+                    if (i == pattern.len - 1) {
+                        return .{ false, 0 };
+                    } else if (pattern[i] != string[j]) {
+                        return .{ false, 0 };
                     }
                 },
                 else => if (pattern[i] != string[j]) return .{ false, 0 },
             }
+        }
+        if (i < pattern.len) {
+            if (pattern[i] == '$' and i == pattern.len - 1) return .{ true, j };
+            return .{ false, 0 };
         }
         return .{ true, j };
     }
@@ -67,4 +88,11 @@ test "match character classes" {
     try std.testing.expect(Regex.matches("world", "w\\Drld")[0]);
     try std.testing.expect(!Regex.matches("world", "w\\drld")[0]);
     try std.testing.expect(Regex.matches("world", "w\\wrld")[0]);
+}
+
+test "find match start end" {
+    try std.testing.expect(Regex.indexOf("world", "^wo").?.start == 0);
+    try std.testing.expect(Regex.indexOf("wororld", "^or") == null);
+    try std.testing.expect(Regex.indexOf("worldld", "ld$").?.start == 5);
+    try std.testing.expect(Regex.indexOf("world", "or$") == null);
 }
