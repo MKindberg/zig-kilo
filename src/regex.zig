@@ -4,6 +4,8 @@ pub const Regex = struct {
     const Token = union(enum) {
         Literal: u8,
         Any: void,
+        CharacterGroup: []const u8,
+        NegCharacterGroup: []const u8,
         CharacterClass: u8,
         Start: void,
         End: void,
@@ -38,6 +40,16 @@ pub const Regex = struct {
                 },
                 '$' => _ = {
                     if (i == pattern.len - 1) tokens.append(Token.End) catch unreachable else tokens.append(Token{ .Literal = pattern[i] }) catch unreachable;
+                },
+                '[' => {
+                    if (std.mem.indexOfScalar(u8, pattern[i..], ']')) |end| {
+                        if (pattern[i + 1] == '^') {
+                            _ = tokens.append(Token{ .NegCharacterGroup = pattern[i + 2 .. i + end] }) catch unreachable;
+                        } else {
+                            _ = tokens.append(Token{ .CharacterGroup = pattern[i + 1 .. i + end] }) catch unreachable;
+                        }
+                        i += end;
+                    } else return RegexError.InvalidPattern;
                 },
                 else => _ = tokens.append(Token{ .Literal = pattern[i] }) catch unreachable,
             }
@@ -81,6 +93,12 @@ pub const Regex = struct {
         switch (tokens[0]) {
             .Literal => |c| if (string[0] == c) return matches_sub(tokens[1..], string[1..], len + 1),
             .Any => return matches_sub(tokens[1..], string[1..], len + 1),
+            .CharacterGroup => |group| {
+                if (std.mem.indexOfScalar(u8, group, string[0]) != null) return matches_sub(tokens[1..], string[1..], len + 1);
+            },
+            .NegCharacterGroup => |group| {
+                if (std.mem.indexOfScalar(u8, group, string[0]) == null) return matches_sub(tokens[1..], string[1..], len + 1);
+            },
             .CharacterClass => |c| if (matches_class(c, string[0])) return matches_sub(tokens[1..], string[1..], len + 1),
             .End => return null,
             .Start => unreachable,
@@ -136,4 +154,11 @@ test "find match start end" {
     try std.testing.expect(Regex.find("wororld", "^or") == null);
     try std.testing.expect(Regex.find("worldld", "ld$").?.start == 5);
     try std.testing.expect(Regex.find("world", "or$") == null);
+}
+
+test "character group" {
+    try std.testing.expect(Regex.find("world", "[w]orld") != null);
+    try std.testing.expect(Regex.find("world", "w[fewoihw]rld") != null);
+    try std.testing.expect(Regex.find("world", "worl[fewdoihw]") != null);
+    try std.testing.expect(Regex.find("world", "[^feoih]orld") != null);
 }
