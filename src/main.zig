@@ -613,7 +613,7 @@ fn editorFindCallback(query: []u8, key: u32) !void {
         if (current == -1) current = @intCast(E.rows.items.len - 1) else if (current == E.rows.items.len) current = 0;
 
         var row = E.rows.items[@as(usize, @intCast(current))];
-        if (Regex.indexOf(row.render.items, query)) |match| {
+        if (Regex.find(row.render.items, query)) |match| {
             Static.last_match = current;
             E.c.y = @intCast(current);
             E.c.x = row.rxToCx(match.start);

@@ -1,98 +1,139 @@
 const std = @import("std");
 
-pub const Match = struct {
-    start: usize,
-    len: usize,
-};
-
 pub const Regex = struct {
-    pub fn indexOf(haystack: []const u8, needle: []const u8) ?Match {
-        if (needle.len > 1 and needle[0] == '^') {
-            const m = matches(haystack, needle[1..]);
-            const match = m[0];
-            const len = m[1];
-            if (match) {
-                return Match{ .start = 0, .len = len };
+    const Token = union(enum) {
+        Literal: u8,
+        Any: void,
+        CharacterClass: u8,
+        Start: void,
+        End: void,
+    };
+
+    const RegexError = error{
+        InvalidPattern,
+    };
+
+    pub fn parse(allocator: std.mem.Allocator, pattern: []const u8) RegexError!std.ArrayList(Token) {
+        var tokens = std.ArrayList(Token).init(allocator);
+        errdefer tokens.deinit();
+        var i: usize = 0;
+        while (i < pattern.len) : (i += 1) {
+            switch (pattern[i]) {
+                '\\' => {
+                    i += 1;
+                    if (i == pattern.len) return RegexError.InvalidPattern;
+                    const character_classes = "cdDsSwWxO";
+                    const escaped_characters = "\\^$.|?*+()[]{}";
+                    if (std.mem.indexOfScalar(u8, character_classes, pattern[i]) != null) {
+                        _ = tokens.append(Token{ .CharacterClass = pattern[i] }) catch unreachable;
+                    } else if (std.mem.indexOfScalar(u8, escaped_characters, pattern[i]) != null) {
+                        _ = tokens.append(Token{ .Literal = pattern[i] }) catch unreachable;
+                    } else {
+                        return RegexError.InvalidPattern;
+                    }
+                },
+                '.' => _ = tokens.append(Token.Any) catch unreachable,
+                '^' => _ = {
+                    if (i == 0) tokens.append(Token.Start) catch unreachable else tokens.append(Token{ .Literal = pattern[i] }) catch unreachable;
+                },
+                '$' => _ = {
+                    if (i == pattern.len - 1) tokens.append(Token.End) catch unreachable else tokens.append(Token{ .Literal = pattern[i] }) catch unreachable;
+                },
+                else => _ = tokens.append(Token{ .Literal = pattern[i] }) catch unreachable,
             }
         }
-        for (0..haystack.len) |i| {
-            const m = matches(haystack[i..], needle);
-            const match = m[0];
-            const len = m[1];
+        return tokens;
+    }
 
-            if (match) {
-                return Match{ .start = i, .len = len };
+    pub fn find(haystack: []const u8, pattern: []const u8) ?Match {
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        const allocator = gpa.allocator();
+
+        const tokens = parse(allocator, pattern) catch return null;
+        defer tokens.deinit();
+
+        return matches(tokens.items, haystack);
+    }
+
+    pub fn matches(tokens: []const Token, string: []const u8) ?Match {
+        if (tokens.len == 0) return null;
+        if (tokens[0] == .Start) {
+            if (matches_sub(tokens[1..], string, 0)) |l| {
+                return Match{ .start = 0, .len = l };
+            }
+            return null;
+        }
+        for (0..string.len) |i| {
+            const match_len = matches_sub(tokens, string[i..], 0);
+            if (match_len != null) {
+                return Match{ .start = i, .len = match_len.? };
             }
         }
         return null;
     }
 
-    fn matches(string: []const u8, pattern: []const u8) struct { bool, usize } {
-        var i: usize = 0;
-        var j: usize = 0;
-        while (i < pattern.len and j < string.len) : ({
-            i += 1;
-            j += 1;
-        }) {
-            switch (pattern[i]) {
-                '.' => continue,
-                '\\' => {
-                    i += 1;
-                    if (i == pattern.len) return .{ false, 0 };
-                    switch (pattern[i]) {
-                        'c' => if (!std.ascii.isControl(string[j])) return .{ false, 0 },
-                        'd' => if (!std.ascii.isDigit(string[j])) return .{ false, 0 },
-                        'D' => if (std.ascii.isDigit(string[j])) return .{ false, 0 },
-                        's' => if (!std.ascii.isWhitespace(string[j])) return .{ false, 0 },
-                        'S' => if (std.ascii.isWhitespace(string[j])) return .{ false, 0 },
-                        'w' => if (!std.ascii.isAlphanumeric(string[j])) return .{ false, 0 },
-                        'W' => if (std.ascii.isAlphanumeric(string[j])) return .{ false, 0 },
-                        'x' => if (!std.ascii.isHex(string[j])) return .{ false, 0 },
-                        'O' => if (!(string[j] >= '0' and string[j] <= '7')) return .{ false, 0 },
-                        '\\' => if (string[j] != '\\') return .{ false, 0 },
-                        '.' => if (string[j] != '.') return .{ false, 0 },
-                        '^' => if (string[j] != '^') return .{ false, 0 },
-                        '$' => if (string[j] != '$') return .{ false, 0 },
-                        else => return .{ false, 0 },
-                    }
-                },
-                '$' => {
-                    if (i == pattern.len - 1) {
-                        return .{ false, 0 };
-                    } else if (pattern[i] != string[j]) {
-                        return .{ false, 0 };
-                    }
-                },
-                else => if (pattern[i] != string[j]) return .{ false, 0 },
-            }
+    fn matches_sub(tokens: []const Token, string: []const u8, len: usize) ?usize {
+        if (tokens.len == 0 or (tokens.len == 1 and tokens[0] == .End and string.len == 0)) {
+            return len;
+        } else if (string.len == 0) {
+            return null;
         }
-        if (i < pattern.len) {
-            if (pattern[i] == '$' and i == pattern.len - 1) return .{ true, j };
-            return .{ false, 0 };
+        switch (tokens[0]) {
+            .Literal => |c| if (string[0] == c) return matches_sub(tokens[1..], string[1..], len + 1),
+            .Any => return matches_sub(tokens[1..], string[1..], len + 1),
+            .CharacterClass => |c| if (matches_class(c, string[0])) return matches_sub(tokens[1..], string[1..], len + 1),
+            .End => return null,
+            .Start => unreachable,
         }
-        return .{ true, j };
+        return null;
+    }
+
+    fn matches_class(class: u8, c: u8) bool {
+        switch (class) {
+            'c' => return std.ascii.isControl(c),
+            'd' => return std.ascii.isDigit(c),
+            'D' => return !std.ascii.isDigit(c),
+            's' => return std.ascii.isWhitespace(c),
+            'S' => return !std.ascii.isWhitespace(c),
+            'w' => return std.ascii.isAlphanumeric(c),
+            'W' => return !std.ascii.isAlphanumeric(c),
+            'x' => return std.ascii.isHex(c),
+            'O' => return c >= '0' and c <= '7',
+            else => unreachable,
+        }
+        return false;
     }
 };
 
+pub const Match = struct {
+    start: usize,
+    len: usize,
+};
+
 test "match literal" {
-    try std.testing.expect(Regex.matches("world", "world")[0]);
+    try std.testing.expect(Regex.find("world", "world") != null);
 }
 
 test "match ." {
-    try std.testing.expect(Regex.matches("world", "w.rld")[0]);
-    try std.testing.expect(Regex.matches("world", ".o.ld")[0]);
-    try std.testing.expect(Regex.matches("world", "wor..")[0]);
+    try std.testing.expect(Regex.find("world", "w.rld") != null);
+    try std.testing.expect(Regex.find("world", ".o.ld") != null);
+    try std.testing.expect(Regex.find("world", "wor..") != null);
+}
+
+test "match class" {
+    try std.testing.expect(Regex.matches_class('s', ' ') == true);
 }
 
 test "match character classes" {
-    try std.testing.expect(Regex.matches("world", "w\\Drld")[0]);
-    try std.testing.expect(!Regex.matches("world", "w\\drld")[0]);
-    try std.testing.expect(Regex.matches("world", "w\\wrld")[0]);
+    try std.testing.expect(Regex.find("world", "w\\Drld") != null);
+    try std.testing.expect(Regex.find("world", "w\\drld") == null);
+    try std.testing.expect(Regex.find("world", "w\\wrld") != null);
+    try std.testing.expect(Regex.find("hello world", "hello\\sworld") != null);
 }
 
 test "find match start end" {
-    try std.testing.expect(Regex.indexOf("world", "^wo").?.start == 0);
-    try std.testing.expect(Regex.indexOf("wororld", "^or") == null);
-    try std.testing.expect(Regex.indexOf("worldld", "ld$").?.start == 5);
-    try std.testing.expect(Regex.indexOf("world", "or$") == null);
+    try std.testing.expect(Regex.find("world", "^wo").?.start == 0);
+    try std.testing.expect(Regex.find("wororld", "^or") == null);
+    try std.testing.expect(Regex.find("worldld", "ld$").?.start == 5);
+    try std.testing.expect(Regex.find("world", "or$") == null);
 }
