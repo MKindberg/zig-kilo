@@ -7,8 +7,14 @@ pub const Regex = struct {
         CharacterGroup: []const u8,
         NegCharacterGroup: []const u8,
         CharacterClass: u8,
+        Quantifier: QuantifierData,
         Start: void,
         End: void,
+    };
+
+    const QuantifierData = struct {
+        min: usize,
+        max: usize,
     };
 
     const RegexError = error{
@@ -51,6 +57,18 @@ pub const Regex = struct {
                         i += end;
                     } else return RegexError.InvalidPattern;
                 },
+                '*', '?', '+' => {
+                    if (tokens.items.len == 0) return RegexError.InvalidPattern;
+                    const last = tokens.getLast();
+                    if (last == .Start or last == .End or last == .Quantifier) return RegexError.InvalidPattern;
+                    const quantifier: QuantifierData = switch (pattern[i]) {
+                        '*' => .{ .min = 0, .max = std.math.maxInt(usize) },
+                        '?' => .{ .min = 0, .max = 1 },
+                        '+' => .{ .min = 1, .max = std.math.maxInt(usize) },
+                        else => unreachable,
+                    };
+                    tokens.insert(tokens.items.len - 1, Token{ .Quantifier = quantifier }) catch unreachable;
+                },
                 else => _ = tokens.append(Token{ .Literal = pattern[i] }) catch unreachable,
             }
         }
@@ -90,20 +108,43 @@ pub const Regex = struct {
         } else if (string.len == 0) {
             return null;
         }
-        switch (tokens[0]) {
-            .Literal => |c| if (string[0] == c) return matches_sub(tokens[1..], string[1..], len + 1),
-            .Any => return matches_sub(tokens[1..], string[1..], len + 1),
-            .CharacterGroup => |group| {
-                if (std.mem.indexOfScalar(u8, group, string[0]) != null) return matches_sub(tokens[1..], string[1..], len + 1);
-            },
-            .NegCharacterGroup => |group| {
-                if (std.mem.indexOfScalar(u8, group, string[0]) == null) return matches_sub(tokens[1..], string[1..], len + 1);
-            },
-            .CharacterClass => |c| if (matches_class(c, string[0])) return matches_sub(tokens[1..], string[1..], len + 1),
-            .End => return null,
-            .Start => unreachable,
+        if (tokens[0] == .Quantifier) {
+            const q = tokens[0].Quantifier;
+            const min = q.min;
+            const max: usize = for (0..@min(string.len, q.max)) |i| {
+                if (!eq(tokens[1], string[i])) {
+                    break @intCast(i);
+                }
+            } else blk: {
+                break :blk @min(string.len, q.max);
+            };
+
+            if (min > max) return null;
+            var capture = max;
+            while (capture > min) : (capture -= 1) {
+                if (matches_sub(tokens[2..], string[capture..], len + capture)) |res| {
+                    return res;
+                }
+            }
+            return matches_sub(tokens[2..], string[min..], len + min);
+        } else if (eq(tokens[0], string[0])) {
+            return matches_sub(tokens[1..], string[1..], len + 1);
         }
         return null;
+    }
+
+    fn eq(token: Token, c: u8) bool {
+        switch (token) {
+            .Literal => return c == token.Literal,
+            .Any => return true,
+            .CharacterGroup => return std.mem.indexOfScalar(u8, token.CharacterGroup, c) != null,
+            .NegCharacterGroup => return std.mem.indexOfScalar(u8, token.NegCharacterGroup, c) == null,
+            .CharacterClass => return matches_class(token.CharacterClass, c),
+            .Start => return false,
+            .End => return false,
+            .Quantifier => return false,
+        }
+        return false;
     }
 
     fn matches_class(class: u8, c: u8) bool {
@@ -161,4 +202,27 @@ test "character group" {
     try std.testing.expect(Regex.find("world", "w[fewoihw]rld") != null);
     try std.testing.expect(Regex.find("world", "worl[fewdoihw]") != null);
     try std.testing.expect(Regex.find("world", "[^feoih]orld") != null);
+}
+
+test "star" {
+    try std.testing.expect(Regex.find("world", "wo.*") != null);
+    try std.testing.expect(Regex.find("world", "wo.*d") != null);
+    try std.testing.expect(Regex.find("wooooooooooorld", "wo*rld") != null);
+    try std.testing.expect(Regex.find("wrld", "wo*rld") != null);
+    try std.testing.expect(Regex.find("wrld", "wo*rd") == null);
+}
+
+test "plus" {
+    try std.testing.expect(Regex.find("world", "wo.+") != null);
+    try std.testing.expect(Regex.find("world", "wo.+d") != null);
+    try std.testing.expect(Regex.find("wooooooooooorld", "wo+rld") != null);
+    try std.testing.expect(Regex.find("wrld", "wo+rld") == null);
+    try std.testing.expect(Regex.find("wrld", "wo+rd") == null);
+}
+
+test "question mark" {
+    try std.testing.expect(Regex.find("world", "wo.?rld") != null);
+    try std.testing.expect(Regex.find("world", "wor?ld") != null);
+    try std.testing.expect(Regex.find("world", "wo.?ld") != null);
+    try std.testing.expect(Regex.find("world", "wo.?d") == null);
 }
