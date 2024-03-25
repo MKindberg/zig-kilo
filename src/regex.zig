@@ -69,6 +69,23 @@ pub const Regex = struct {
                     };
                     tokens.insert(tokens.items.len - 1, Token{ .Quantifier = quantifier }) catch unreachable;
                 },
+                '{' => {
+                    if (tokens.items.len == 0) return RegexError.InvalidPattern;
+                    const last = tokens.getLast();
+                    if (last == .Start or last == .End or last == .Quantifier) return RegexError.InvalidPattern;
+                    const start = i;
+                    const end = start + (std.mem.indexOfScalar(u8, pattern[i..], '}') orelse return RegexError.InvalidPattern);
+                    if (std.mem.indexOfScalar(u8, pattern[i..], ',')) |m| {
+                        const mid = m + i;
+                        const min = std.fmt.parseInt(usize, pattern[start + 1 .. mid], 10) catch return RegexError.InvalidPattern;
+                        const max = if (mid + 1 == end) std.math.maxInt(usize) else std.fmt.parseInt(usize, pattern[mid + 1 .. end], 10) catch return RegexError.InvalidPattern;
+                        tokens.insert(tokens.items.len - 1, Token{ .Quantifier = .{ .min = min, .max = max } }) catch unreachable;
+                    } else {
+                        const n = std.fmt.parseInt(usize, pattern[start + 1 .. end], 10) catch return RegexError.InvalidPattern;
+                        tokens.insert(tokens.items.len - 1, Token{ .Quantifier = .{ .min = n, .max = n } }) catch unreachable;
+                    }
+                    i = end;
+                },
                 else => _ = tokens.append(Token{ .Literal = pattern[i] }) catch unreachable,
             }
         }
@@ -225,4 +242,19 @@ test "question mark" {
     try std.testing.expect(Regex.find("world", "wor?ld") != null);
     try std.testing.expect(Regex.find("world", "wo.?ld") != null);
     try std.testing.expect(Regex.find("world", "wo.?d") == null);
+}
+
+test "number quantifier" {
+    try std.testing.expect(Regex.find("wooorld", "wo{3}rld") != null);
+    try std.testing.expect(Regex.find("wooorld", "wo{2}orld") != null);
+    try std.testing.expect(Regex.find("wooorld", "wo{2}rld") == null);
+    try std.testing.expect(Regex.find("wooorld", "wo{4}rld") == null);
+}
+
+test "range quantifier" {
+    try std.testing.expect(Regex.find("wooorld", "wo{3,7}rld") != null);
+    try std.testing.expect(Regex.find("wooorld", "wo{2,3}rld") != null);
+    try std.testing.expect(Regex.find("wooorld", "wo{1,2}rld") == null);
+    try std.testing.expect(Regex.find("wooorld", "wo{4,5}rld") == null);
+    try std.testing.expect(Regex.find("wooorld", "wo{1,}rld") != null);
 }
